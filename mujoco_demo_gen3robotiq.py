@@ -1,11 +1,12 @@
 """
 Gen3 + Robotiq-85 in MuJoCo: control by EEF pose sequence + 3-phase gripper (explicit mimic)
++ DLS IK with SAFE joint-speed limiting (10 deg/s)
 
-What this does:
-- Loops forever through an arbitrary EEF pose waypoint sequence (position + quaternion)
+- Loops forever through an EEF pose waypoint sequence (position + quaternion)
 - Tracks EEF pose with damped-least-squares IK each frame
-- Controls Robotiq-85 gripper with a 3-phase command (+1 open, -1 close, 0 hold)
-- FIX: MuJoCo often ignores URDF <mimic>, so we explicitly drive the mimic joints so BOTH fingers move
+- Controls Robotiq-85 gripper with 3-phase command (+1 open, -1 close, 0 hold)
+- Explicitly drives mimic joints so BOTH fingers move (URDF <mimic> often ignored)
+- NEW: clamps joint updates in IK to a safe speed limit (10 deg/s per joint)
 
 Install:
   pip install mujoco numpy
@@ -18,7 +19,6 @@ import time
 import numpy as np
 import mujoco
 import mujoco.viewer
-
 
 # ======== UPDATE THIS PATH ON YOUR MACHINE ========
 URDF_PATH = r"D:\mujoco_simulation\gen3_2f85.urdf"
@@ -145,10 +145,6 @@ def _get_joint_ids_by_name(model: mujoco.MjModel, joint_names: list[str]) -> lis
 
 
 def find_ee_target(model: mujoco.MjModel) -> tuple[int, str]:
-    """
-    Prefer a body that corresponds to the gripper base / tool frame.
-    Returns (body_id, name)
-    """
     candidates = [
         "gen3_robotiq_85_base_link",
         "gen3_end_effector_link",
@@ -173,7 +169,7 @@ def clamp_to_joint_limits(model: mujoco.MjModel, joint_ids: list[int], q: np.nda
 
 
 # -----------------------------
-# IK (damped least squares)
+# IK (damped least squares) + safe speed limit
 # -----------------------------
 def get_body_pose(model: mujoco.MjModel, data: mujoco.MjData, body_id: int) -> tuple[np.ndarray, np.ndarray]:
     p = data.xpos[body_id].copy()
@@ -189,6 +185,17 @@ def jacobian_6d_body(model: mujoco.MjModel, data: mujoco.MjData, body_id: int) -
     return np.vstack([jacp, jacr])
 
 
+def clamp_dq_by_speed(dq: np.ndarray, qd_max: np.ndarray, dt_step: float) -> np.ndarray:
+    """
+    Clamp joint increment dq so:
+      |dq_i| <= qd_max[i] * dt_step
+    """
+    dq = np.asarray(dq, dtype=float)
+    qd_max = np.asarray(qd_max, dtype=float)
+    dq_max = qd_max * float(dt_step)
+    return np.clip(dq, -dq_max, dq_max)
+
+
 def ik_step_dls(
     model: mujoco.MjModel,
     data: mujoco.MjData,
@@ -202,6 +209,9 @@ def ik_step_dls(
     rot_w: float = 0.6,
     damping: float = 2e-2,
     step_scale: float = 0.9,
+    # NEW:
+    dt_step: float = 1.0 / 600.0,
+    qd_max: np.ndarray | None = None,   # rad/s, len=7
 ) -> float:
     p_cur, q_cur = get_body_pose(model, data, body_id)
 
@@ -218,8 +228,13 @@ def ik_step_dls(
     y = np.linalg.solve(A, e6)
     dq = J_arm.T @ y
 
+    # apply scale then clamp by safe speed
+    dq = step_scale * dq
+    if qd_max is not None:
+        dq = clamp_dq_by_speed(dq, qd_max, dt_step)
+
     q = np.array([data.qpos[adr] for adr in qpos_adrs], dtype=float)
-    q_new = q + step_scale * dq
+    q_new = q + dq
     q_new = clamp_to_joint_limits(model, arm_joint_ids, q_new)
 
     for adr, val in zip(qpos_adrs, q_new):
@@ -235,11 +250,16 @@ def ik_step_dls(
 def build_gripper_controls(model: mujoco.MjModel):
     """
     Returns:
-      grip_controls: list of (qpos_adr, lo, hi, multiplier, joint_name)
+      controls: list of (qpos_adr, lo, hi, multiplier, joint_name)
       lo_m, hi_m: master joint range
     """
-    GRIP_MASTER = "gen3_robotiq_85_left_knuckle_joint"
-    GRIP_MIMICS = [
+    MASTER_CANDIDATES = [
+        "gen3_robotiq_85_left_knuckle_joint",
+        "robotiq_85_left_knuckle_joint",
+        "left_knuckle_joint",
+    ]
+
+    MIMICS = [
         ("gen3_robotiq_85_right_knuckle_joint",       -1.0),
         ("gen3_robotiq_85_left_inner_knuckle_joint",  +1.0),
         ("gen3_robotiq_85_right_inner_knuckle_joint", -1.0),
@@ -253,24 +273,31 @@ def build_gripper_controls(model: mujoco.MjModel):
             return None
         jid = int(jid)
         adr = int(model.jnt_qposadr[jid])
-        limited = bool(model.jnt_limited[jid])
-        if limited:
+        if model.jnt_limited[jid]:
             lo, hi = float(model.jnt_range[jid][0]), float(model.jnt_range[jid][1])
         else:
             lo, hi = None, None
         return adr, lo, hi
 
-    master = _info(GRIP_MASTER)
-    if master is None:
-        print(f"[WARN] Missing gripper master joint '{GRIP_MASTER}'. Gripper disabled.")
+    master_name = None
+    master_info = None
+    for nm in MASTER_CANDIDATES:
+        info = _info(nm)
+        if info is not None:
+            master_name = nm
+            master_info = info
+            break
+
+    if master_info is None:
+        print("[WARN] Could not find a gripper master joint. Gripper disabled.")
         return [], 0.0, 0.8
 
-    adr_m, lo_m, hi_m = master
+    adr_m, lo_m, hi_m = master_info
     if lo_m is None or hi_m is None:
-        lo_m, hi_m = 0.0, 0.8  # URDF says [0, 0.8]
+        lo_m, hi_m = 0.0, 0.8
 
-    controls = [(adr_m, lo_m, hi_m, 1.0, GRIP_MASTER)]
-    for jname, mult in GRIP_MIMICS:
+    controls = [(adr_m, lo_m, hi_m, 1.0, master_name)]
+    for jname, mult in MIMICS:
         info = _info(jname)
         if info is None:
             print(f"[WARN] Missing gripper mimic joint '{jname}' (skipping)")
@@ -278,36 +305,27 @@ def build_gripper_controls(model: mujoco.MjModel):
         adr, lo, hi = info
         controls.append((adr, lo, hi, float(mult), jname))
 
-    print(f"[INFO] Gripper master '{GRIP_MASTER}' range=[{lo_m:.3f}, {hi_m:.3f}]")
+    print(f"[INFO] Gripper master '{master_name}' range=[{lo_m:.3f}, {hi_m:.3f}]")
     print("[INFO] Gripper controlled joints:")
     for adr, lo, hi, mult, name in controls:
-        if lo is None:
-            lim = "unlimited"
-        else:
-            lo2, hi2 = (lo, hi) if hi >= lo else (hi, lo)
-            lim = f"[{lo2:.3f},{hi2:.3f}]"
+        lim = "unlimited" if lo is None else f"[{min(lo,hi):.3f},{max(lo,hi):.3f}]"
         print(f"  {name:40s} mult={mult:+.1f} limits={lim}")
 
     return controls, lo_m, hi_m
 
 
 def apply_gripper(model: mujoco.MjModel, data: mujoco.MjData, controls, lo_m, hi_m, g01: float):
-    """
-    g01 in [0,1]: 0=closed, 1=open (by default).
-    If you want opposite, change q_master mapping below.
-    """
     if not controls:
         return
 
-    # Master joint in [lo_m, hi_m]
     q_master = lo_m + g01 * (hi_m - lo_m)
 
-    for adr, lo, hi, mult, name in controls:
-        q = mult * q_master
+    for adr, lo, hi, mult, _name in controls:
+        q = float(mult * q_master)
         if lo is not None and hi is not None:
             lo2, hi2 = (lo, hi) if hi >= lo else (hi, lo)
             q = float(np.clip(q, lo2, hi2))
-        data.qpos[adr] = float(q)
+        data.qpos[adr] = q
 
     mujoco.mj_forward(model, data)
 
@@ -337,7 +355,12 @@ def main():
     dt = 1.0 / 60.0
     IK_ITERS = 10
 
-    # Waypoints (longer distance)
+    # NEW: Safe joint speed limit = 10 deg/s for all 7 joints
+    qd_safe = np.deg2rad(10.0)  # rad/s
+    qd_max = np.full(7, qd_safe, dtype=float)
+    dt_inner = dt / IK_ITERS  # per-IK-iteration timestep for clamping
+
+    # Waypoints
     p0, q0 = get_body_pose(model, data, ee_body_id)
 
     def offset_pose(dp: np.ndarray, yaw_deg: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
@@ -348,15 +371,14 @@ def main():
 
     DX, DY, DZ = 0.26, 0.20, 0.14  # meters
 
-    # (p, q, duration, gripper_cmd)
     waypoints = [
-        (*offset_pose(np.array([0.00, 0.00, 0.00]), 0.0),   1.2,  0),
-        (*offset_pose(np.array([DX,   0.00, 0.00]), 20.0),  2.0, +1),
-        (*offset_pose(np.array([DX,   DY,   0.00]), 0.0),   2.0,  0),
-        (*offset_pose(np.array([0.00, DY,   0.00]), -20.0), 2.0, -1),
-        (*offset_pose(np.array([0.00, 0.00, DZ  ]), 0.0),   2.0,  0),
-        (*offset_pose(np.array([DX*0.6, DY*0.3, DZ]), 10.0),2.0, +1),
-        (*offset_pose(np.array([0.00, 0.00, 0.00]), 0.0),   2.0,  0),
+        (*offset_pose(np.array([0.00, 0.00, 0.00]), 0.0),    1.2,  0),
+        (*offset_pose(np.array([DX,   0.00, 0.00]), 20.0),   2.0, +1),
+        (*offset_pose(np.array([DX,   DY,   0.00]), 0.0),    2.0,  0),
+        (*offset_pose(np.array([0.00, DY,   0.00]), -20.0),  2.0, -1),
+        (*offset_pose(np.array([0.00, 0.00, DZ  ]), 0.0),    2.0,  0),
+        (*offset_pose(np.array([DX*0.6, DY*0.3, DZ]), 10.0), 2.0, +1),
+        (*offset_pose(np.array([0.00, 0.00, 0.00]), 0.0),    2.0,  0),
     ]
 
     # Gripper open fraction g in [0,1]
@@ -368,12 +390,10 @@ def main():
         viewer.cam.elevation = -20
         viewer.cam.azimuth = 135
 
-        t0 = time.perf_counter()
-        k_global = 0
+        next_step_time = time.perf_counter()
 
         try:
             while viewer.is_running():
-                # iterate segments (including wrap-around)
                 for seg in range(len(waypoints)):
                     pA, qA, TA, cmdA = waypoints[seg]
                     pB, qB, _, _ = waypoints[(seg + 1) % len(waypoints)]
@@ -389,28 +409,30 @@ def main():
                         p_des = (1.0 - s) * pA + s * pB
                         q_des = quat_slerp(qA, qB, s)
 
-                        # Gripper update (3-phase)
+                        # Gripper update (3-phase): +1 open, -1 close, 0 hold
                         g += float(cmdA) * GRIP_SPEED * dt
                         g = float(np.clip(g, 0.0, 1.0))
                         apply_gripper(model, data, grip_controls, lo_m, hi_m, g)
 
-                        # IK
+                        # IK with safe speed-limited joint steps
                         for _ in range(IK_ITERS):
                             err = ik_step_dls(
                                 model, data, ee_body_id,
                                 arm_joint_ids, qpos_adrs, dof_adrs,
                                 p_des, q_des,
+                                dt_step=dt_inner,
+                                qd_max=qd_max,
                             )
                             if err < 1e-4:
                                 break
 
                         viewer.sync()
 
-                        # strict pacing
-                        target = t0 + k_global * dt
-                        while time.perf_counter() < target:
-                            time.sleep(0.0005)
-                        k_global += 1
+                        # stable pacing (no drift)
+                        next_step_time += dt
+                        sleep_s = next_step_time - time.perf_counter()
+                        if sleep_s > 0:
+                            time.sleep(sleep_s)
 
         except KeyboardInterrupt:
             pass

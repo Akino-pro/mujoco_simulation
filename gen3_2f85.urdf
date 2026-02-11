@@ -6,6 +6,38 @@
 <robot name="gen3_">
   <!-- create link fixed to the "world" -->
   <link name="world"/>
+  <!-- ===== Table (top surface at z = 0) ===== -->
+<link name="table">
+  <visual>
+    <!-- keep center at -0.03 so top stays at z=0 -->
+    <origin xyz="0 0 -0.03" rpy="0 0 0"/>
+    <geometry>
+      <box size="2.4 1.6 0.06"/>
+    </geometry>
+    <material name="table_gray">
+      <color rgba="0.55 0.40 0.25 1"/>
+    </material>
+  </visual>
+
+  <collision>
+    <origin xyz="0 0 -0.03" rpy="0 0 0"/>
+    <geometry>
+      <box size="2.4 1.6 0.06"/>
+    </geometry>
+  </collision>
+
+  <inertial>
+    <origin xyz="0 0 -0.03" rpy="0 0 0"/>
+    <mass value="200"/>
+    <inertia ixx="20" ixy="0" ixz="0" iyy="20" iyz="0" izz="20"/>
+  </inertial>
+</link>
+
+<joint name="world_to_table" type="fixed">
+  <parent link="world"/>
+  <child link="table"/>
+  <origin xyz="0 0 0" rpy="0 0 0"/>
+</joint>
   <material name="aluminum">
     <color rgba="0.5 0.5 0.5 1"/>
   </material>
@@ -134,7 +166,7 @@
   </ros2_control>
   <joint name="gen3_base_joint" type="fixed">
     <origin rpy="0 0 0" xyz="0 0 0"/>
-    <parent link="world"/>
+    <parent link="table"/>
     <child link="gen3_base_link"/>
   </joint>
   <link name="gen3_base_link">
