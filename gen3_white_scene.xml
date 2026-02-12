@@ -1,0 +1,27 @@
+<mujoco>
+  <visual>
+    <!-- White-ish background -->
+    <headlight diffuse="0.9 0.9 0.9" ambient="0.6 0.6 0.6" specular="0.2 0.2 0.2"/>
+    <rgba haze="1 1 1 1"/>
+  </visual>
+
+  <asset>
+    <!-- Pure white background -->
+    <texture type="skybox" builtin="gradient"
+             rgb1="1 1 1" rgb2="1 1 1" width="256" height="256"/>
+
+    <!-- White floor -->
+    <material name="floor_white" rgba="1 1 1 1" reflectance="0.05"/>
+
+    <!-- (Optional) make all geom defaults white-ish too -->
+    <material name="geom_white" rgba="0.95 0.95 0.95 1" reflectance="0.1"/>
+  </asset>
+
+  <worldbody>
+    <!-- Big white ground plane -->
+    <geom name="floor" type="plane" size="10 10 0.1" pos="0 0 0" material="floor_white"/>
+  </worldbody>
+
+  <!-- Include your URDF robot (MuJoCo supports this include) -->
+  <include file="gen3_2f85.urdf"/>
+</mujoco>

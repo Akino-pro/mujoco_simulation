@@ -1,441 +1,453 @@
 """
 Gen3 + Robotiq-85 in MuJoCo: control by EEF pose sequence + 3-phase gripper (explicit mimic)
 + DLS IK with SAFE joint-speed limiting (10 deg/s)
++ Wrist camera window
 
-- Loops forever through an EEF pose waypoint sequence (position + quaternion)
-- Tracks EEF pose with damped-least-squares IK each frame
-- Controls Robotiq-85 gripper with 3-phase command (+1 open, -1 close, 0 hold)
-- Explicitly drives mimic joints so BOTH fingers move (URDF <mimic> often ignored)
-- NEW: clamps joint updates in IK to a safe speed limit (10 deg/s per joint)
+ROBUST FIXES:
+- INLINE robot <asset> children directly into the scene XML (no asset include).
+- INLINE robot <worldbody> children directly under <body name="gen3_mount"> (no body include).
+  (This avoids MuJoCo include XML single-root requirements and the "multiple root tags" issue.)
 
 Install:
-  pip install mujoco numpy
-
-Run:
-  python gen3_mujoco_eef_ik_gripper_loop.py
+  pip install mujoco numpy opencv-python
 """
 import os
 import time
+import re
+from pathlib import Path
+
 import numpy as np
 import mujoco
 import mujoco.viewer
 
+from helper_functions import (
+    _get_joint_ids_by_name, find_ee_target, build_gripper_controls, quat_from_mat3,
+    set_white_environment_visuals, ik_step_dls, apply_gripper, show_wrist_window,
+    make_R_with_axis_k_down, make_free_camera_from_frame_pose
+)
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
+
 # ======== UPDATE THIS PATH ON YOUR MACHINE ========
-URDF_PATH = r"D:\mujoco_simulation\gen3_2f85.urdf"
-os.chdir(os.path.dirname(URDF_PATH))
+URDF_PATH = r"D:\mujoco_simulation\gen3_modified.urdf"
 
 
-# -----------------------------
-# Quaternion / rotation helpers
-# -----------------------------
-def quat_normalize(q: np.ndarray) -> np.ndarray:
-    q = np.asarray(q, dtype=float)
-    n = np.linalg.norm(q)
-    return q / n if n > 0 else np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+def _extract_tag_inner(text: str, tag: str) -> str:
+    m = re.search(rf"<{tag}\b[^>]*>(.*?)</{tag}>", text, flags=re.DOTALL)
+    if m:
+        return m.group(1)
+    m2 = re.search(rf"<{tag}\b[^>]*/>", text, flags=re.DOTALL)
+    if m2:
+        return ""
+    return ""
 
 
-def quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    # [w,x,y,z]
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
-    return np.array([
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2,
-    ], dtype=float)
+def _strip_comments(s: str) -> str:
+    return re.sub(r"<!--.*?-->", "", s or "", flags=re.DOTALL)
 
 
-def quat_conj(q: np.ndarray) -> np.ndarray:
-    w, x, y, z = q
-    return np.array([w, -x, -y, -z], dtype=float)
+def _ensure_nonempty_asset_children(asset_inner: str) -> str:
+    keepalive = '<material name="__asset_keepalive" rgba="1 1 1 1"/>\n'
+    s = (asset_inner or "").strip()
+    if not s:
+        return keepalive
+    if not _strip_comments(s).strip():
+        return keepalive
+    return s + "\n"
 
 
-def quat_slerp(q0: np.ndarray, q1: np.ndarray, s: float) -> np.ndarray:
-    q0 = quat_normalize(q0)
-    q1 = quat_normalize(q1)
-    dot = float(np.dot(q0, q1))
-    if dot < 0.0:
-        q1 = -q1
-        dot = -dot
-    dot = np.clip(dot, -1.0, 1.0)
-    if dot > 0.9995:
-        return quat_normalize(q0 + s * (q1 - q0))
-    theta = np.arccos(dot)
-    sin_theta = np.sin(theta)
-    a = np.sin((1.0 - s) * theta) / sin_theta
-    b = np.sin(s * theta) / sin_theta
-    return quat_normalize(a * q0 + b * q1)
+def _ensure_nonempty_body_children(worldbody_inner: str) -> str:
+    # We inline this inside <body name="gen3_mount"> ... </body>
+    # So any valid body-children are fine; but make sure it's not comment-only/empty.
+    keepalive = '<geom name="__body_keepalive" type="sphere" size="0.0001" rgba="0 0 0 0"/>\n'
+    s = (worldbody_inner or "").strip()
+    if not s:
+        return keepalive
+    if not _strip_comments(s).strip():
+        return keepalive
+    return s + "\n"
 
 
-def mat3_from_xmat(xmat9: np.ndarray) -> np.ndarray:
-    return np.array(xmat9, dtype=float).reshape(3, 3)
+def _indent(s: str, n_spaces: int) -> str:
+    pad = " " * n_spaces
+    lines = (s or "").splitlines()
+    return "\n".join(pad + ln if ln.strip() else ln for ln in lines)
 
 
-def quat_from_mat3(R: np.ndarray) -> np.ndarray:
-    R = np.asarray(R, dtype=float)
-    tr = np.trace(R)
-    if tr > 0:
-        S = np.sqrt(tr + 1.0) * 2.0
-        w = 0.25 * S
-        x = (R[2, 1] - R[1, 2]) / S
-        y = (R[0, 2] - R[2, 0]) / S
-        z = (R[1, 0] - R[0, 1]) / S
-    else:
-        if R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-            S = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
-            w = (R[2, 1] - R[1, 2]) / S
-            x = 0.25 * S
-            y = (R[0, 1] + R[1, 0]) / S
-            z = (R[0, 2] + R[2, 0]) / S
-        elif R[1, 1] > R[2, 2]:
-            S = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
-            w = (R[0, 2] - R[2, 0]) / S
-            x = (R[0, 1] + R[1, 0]) / S
-            y = 0.25 * S
-            z = (R[1, 2] + R[2, 1]) / S
-        else:
-            S = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
-            w = (R[1, 0] - R[0, 1]) / S
-            x = (R[0, 2] + R[2, 0]) / S
-            y = (R[1, 2] + R[2, 1]) / S
-            z = 0.25 * S
-    return quat_normalize(np.array([w, x, y, z], dtype=float))
-
-
-def rotvec_from_quat(q_err: np.ndarray) -> np.ndarray:
-    q_err = quat_normalize(q_err)
-    w = float(np.clip(q_err[0], -1.0, 1.0))
-    v = q_err[1:]
-    sin_half = np.linalg.norm(v)
-    if sin_half < 1e-12:
-        return np.zeros(3, dtype=float)
-    axis = v / sin_half
-    angle = 2.0 * np.arctan2(sin_half, w)
-    if angle > np.pi:
-        angle -= 2.0 * np.pi
-    return axis * angle
-
-
-# -----------------------------
-# MuJoCo helpers
-# -----------------------------
-def _get_joint_ids_by_name(model: mujoco.MjModel, joint_names: list[str]) -> list[int]:
-    joint_ids: list[int] = []
-    missing: list[str] = []
-    for name in joint_names:
-        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
-        if jid < 0:
-            missing.append(name)
-        else:
-            joint_ids.append(int(jid))
-    if missing:
-        all_joint_names = []
-        for j in range(model.njnt):
-            nm = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j)
-            if nm:
-                all_joint_names.append(nm)
-        raise RuntimeError(
-            "Missing joints:\n"
-            f"  {missing}\n\n"
-            "Example available joints:\n"
-            "  " + ", ".join(all_joint_names[:80]) + (" ..." if len(all_joint_names) > 80 else "")
-        )
-    return joint_ids
-
-
-def find_ee_target(model: mujoco.MjModel) -> tuple[int, str]:
-    candidates = [
-        "gen3_robotiq_85_base_link",
-        "gen3_end_effector_link",
-        "gen3_bracelet_link",
-    ]
-    for nm in candidates:
-        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, nm)
-        if bid >= 0:
-            return int(bid), nm
-    last_body = model.nbody - 1
-    nm = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, last_body) or f"body_{last_body}"
-    return int(last_body), nm
-
-
-def clamp_to_joint_limits(model: mujoco.MjModel, joint_ids: list[int], q: np.ndarray) -> np.ndarray:
-    q = q.copy()
-    for i, jid in enumerate(joint_ids):
-        if model.jnt_limited[jid]:
-            lo, hi = model.jnt_range[jid]
-            q[i] = float(np.clip(q[i], lo, hi))
-    return q
-
-
-# -----------------------------
-# IK (damped least squares) + safe speed limit
-# -----------------------------
-def get_body_pose(model: mujoco.MjModel, data: mujoco.MjData, body_id: int) -> tuple[np.ndarray, np.ndarray]:
-    p = data.xpos[body_id].copy()
-    R = mat3_from_xmat(data.xmat[body_id].copy())
-    q = quat_from_mat3(R)
-    return p, q
-
-
-def jacobian_6d_body(model: mujoco.MjModel, data: mujoco.MjData, body_id: int) -> np.ndarray:
-    jacp = np.zeros((3, model.nv), dtype=float)
-    jacr = np.zeros((3, model.nv), dtype=float)
-    mujoco.mj_jacBody(model, data, jacp, jacr, body_id)
-    return np.vstack([jacp, jacr])
-
-
-def clamp_dq_by_speed(dq: np.ndarray, qd_max: np.ndarray, dt_step: float) -> np.ndarray:
-    """
-    Clamp joint increment dq so:
-      |dq_i| <= qd_max[i] * dt_step
-    """
-    dq = np.asarray(dq, dtype=float)
-    qd_max = np.asarray(qd_max, dtype=float)
-    dq_max = qd_max * float(dt_step)
-    return np.clip(dq, -dq_max, dq_max)
-
-
-def ik_step_dls(
-    model: mujoco.MjModel,
-    data: mujoco.MjData,
-    body_id: int,
-    arm_joint_ids: list[int],
-    qpos_adrs: list[int],
-    dof_adrs: list[int],
-    p_des: np.ndarray,
-    q_des: np.ndarray,
-    pos_w: float = 1.0,
-    rot_w: float = 0.6,
-    damping: float = 2e-2,
-    step_scale: float = 0.9,
-    # NEW:
-    dt_step: float = 1.0 / 600.0,
-    qd_max: np.ndarray | None = None,   # rad/s, len=7
-) -> float:
-    p_cur, q_cur = get_body_pose(model, data, body_id)
-
-    e_pos = (p_des - p_cur) * pos_w
-    q_err = quat_mul(q_des, quat_conj(q_cur))
-    e_rot = rotvec_from_quat(q_err) * rot_w
-    e6 = np.hstack([e_pos, e_rot])
-    err = float(np.linalg.norm(e6))
-
-    J = jacobian_6d_body(model, data, body_id)
-    J_arm = J[:, dof_adrs]  # 6 x 7
-
-    A = (J_arm @ J_arm.T) + (damping ** 2) * np.eye(6)
-    y = np.linalg.solve(A, e6)
-    dq = J_arm.T @ y
-
-    # apply scale then clamp by safe speed
-    dq = step_scale * dq
-    if qd_max is not None:
-        dq = clamp_dq_by_speed(dq, qd_max, dt_step)
-
-    q = np.array([data.qpos[adr] for adr in qpos_adrs], dtype=float)
-    q_new = q + dq
-    q_new = clamp_to_joint_limits(model, arm_joint_ids, q_new)
-
-    for adr, val in zip(qpos_adrs, q_new):
-        data.qpos[adr] = float(val)
-
-    mujoco.mj_forward(model, data)
-    return err
-
-
-# -----------------------------
-# Gripper explicit mimic control
-# -----------------------------
-def build_gripper_controls(model: mujoco.MjModel):
-    """
-    Returns:
-      controls: list of (qpos_adr, lo, hi, multiplier, joint_name)
-      lo_m, hi_m: master joint range
-    """
-    MASTER_CANDIDATES = [
-        "gen3_robotiq_85_left_knuckle_joint",
-        "robotiq_85_left_knuckle_joint",
-        "left_knuckle_joint",
-    ]
-
-    MIMICS = [
-        ("gen3_robotiq_85_right_knuckle_joint",       -1.0),
-        ("gen3_robotiq_85_left_inner_knuckle_joint",  +1.0),
-        ("gen3_robotiq_85_right_inner_knuckle_joint", -1.0),
-        ("gen3_robotiq_85_left_finger_tip_joint",     -1.0),
-        ("gen3_robotiq_85_right_finger_tip_joint",    +1.0),
-    ]
-
-    def _info(jname: str):
-        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname)
-        if jid < 0:
-            return None
-        jid = int(jid)
-        adr = int(model.jnt_qposadr[jid])
-        if model.jnt_limited[jid]:
-            lo, hi = float(model.jnt_range[jid][0]), float(model.jnt_range[jid][1])
-        else:
-            lo, hi = None, None
-        return adr, lo, hi
-
-    master_name = None
-    master_info = None
-    for nm in MASTER_CANDIDATES:
-        info = _info(nm)
-        if info is not None:
-            master_name = nm
-            master_info = info
-            break
-
-    if master_info is None:
-        print("[WARN] Could not find a gripper master joint. Gripper disabled.")
-        return [], 0.0, 0.8
-
-    adr_m, lo_m, hi_m = master_info
-    if lo_m is None or hi_m is None:
-        lo_m, hi_m = 0.0, 0.8
-
-    controls = [(adr_m, lo_m, hi_m, 1.0, master_name)]
-    for jname, mult in MIMICS:
-        info = _info(jname)
-        if info is None:
-            print(f"[WARN] Missing gripper mimic joint '{jname}' (skipping)")
-            continue
-        adr, lo, hi = info
-        controls.append((adr, lo, hi, float(mult), jname))
-
-    print(f"[INFO] Gripper master '{master_name}' range=[{lo_m:.3f}, {hi_m:.3f}]")
-    print("[INFO] Gripper controlled joints:")
-    for adr, lo, hi, mult, name in controls:
-        lim = "unlimited" if lo is None else f"[{min(lo,hi):.3f},{max(lo,hi):.3f}]"
-        print(f"  {name:40s} mult={mult:+.1f} limits={lim}")
-
-    return controls, lo_m, hi_m
-
-
-def apply_gripper(model: mujoco.MjModel, data: mujoco.MjData, controls, lo_m, hi_m, g01: float):
-    if not controls:
-        return
-
-    q_master = lo_m + g01 * (hi_m - lo_m)
-
-    for adr, lo, hi, mult, _name in controls:
-        q = float(mult * q_master)
-        if lo is not None and hi is not None:
-            lo2, hi2 = (lo, hi) if hi >= lo else (hi, lo)
-            q = float(np.clip(q, lo2, hi2))
-        data.qpos[adr] = q
-
-    mujoco.mj_forward(model, data)
-
-
-# -----------------------------
-# Main
-# -----------------------------
 def main():
-    model = mujoco.MjModel.from_xml_path(URDF_PATH)
+    urdf_abs = os.path.abspath(URDF_PATH)
+    urdf_dir = os.path.dirname(urdf_abs)
+    os.chdir(urdf_dir)
+
+    # 1) Load URDF via MuJoCo importer
+    robot_model = mujoco.MjModel.from_xml_path(urdf_abs)
+
+    # 2) Export importer result as MJCF
+    robot_mjcf_path = os.path.join(urdf_dir, "_gen3_from_urdf.xml")
+    mujoco.mj_saveLastXML(robot_mjcf_path, robot_model)
+
+    robot_text = Path(robot_mjcf_path).read_text(encoding="utf-8", errors="ignore")
+
+    asset_inner = _extract_tag_inner(robot_text, "asset")
+    worldbody_inner = _extract_tag_inner(robot_text, "worldbody")
+
+    asset_children = _ensure_nonempty_asset_children(asset_inner)
+    body_children  = _ensure_nonempty_body_children(worldbody_inner)
+
+    # 3) Build the scene MJCF (assets + bodies INLINED)
+    scene_path = os.path.join(urdf_dir, "_gen3_scene_with_cubes.xml")
+
+    TABLE_TOP_Z = 0.800  # table top height (meters)
+    scene_xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<mujoco model="gen3_scene">
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
+
+  <visual>
+    <global fovy="60"/>
+    <map znear="0.001"/>
+  </visual>
+
+  <asset>
+    <!-- scene materials -->
+    <material name="mat_green" rgba="0.10 0.90 0.10 1"/>
+    <material name="mat_blue"  rgba="0.10 0.30 0.95 1"/>
+    <material name="mat_gray"  rgba="0.85 0.85 0.85 1"/>
+    <material name="mat_table" rgba="0.90 0.90 0.90 1"/>
+    <material name="mat_leg"   rgba="0.25 0.25 0.25 1"/>
+
+    <!-- robot meshes/materials (INLINED) -->
+{_indent(asset_children, 4)}
+  </asset>
+
+  <worldbody>
+    <light pos="0.6 0.0 1.2" dir="-0.6 0 -1" directional="true" diffuse="1 1 1" ambient="0.4 0.4 0.4"/>
+    <light pos="0.0 0.6 1.0" dir="0 -0.6 -1" directional="true" diffuse="0.8 0.8 0.8" ambient="0.3 0.3 0.3"/>
+
+    <!-- Ground plane (visual only) -->
+    <geom name="bg_plane" type="plane" pos="0 0 -0.001" size="3 3 0.1"
+          material="mat_gray" rgba="1 1 1 1" contype="0" conaffinity="0"/>
+
+    <!-- Table: top surface at z = 0.800 -->
+    <body name="table" pos="0 0 0.775">
+      <geom name="table_collision" size="0.55 0.45 0.025" type="box" material="mat_table" contype="1" conaffinity="1"/>
+      <geom name="table_visual"    size="0.55 0.45 0.025" type="box" material="mat_table" contype="0" conaffinity="0" group="1"/>
+      <geom name="leg1" type="cylinder" size="0.02 0.38" pos=" 0.48  0.38 -0.38" material="mat_leg" contype="0" conaffinity="0" group="1"/>
+      <geom name="leg2" type="cylinder" size="0.02 0.38" pos="-0.48  0.38 -0.38" material="mat_leg" contype="0" conaffinity="0" group="1"/>
+      <geom name="leg3" type="cylinder" size="0.02 0.38" pos="-0.48 -0.38 -0.38" material="mat_leg" contype="0" conaffinity="0" group="1"/>
+      <geom name="leg4" type="cylinder" size="0.02 0.38" pos=" 0.48 -0.38 -0.38" material="mat_leg" contype="0" conaffinity="0" group="1"/>
+      <site name="table_top" pos="0 0 0.025" size="0.001" rgba="0 0 0 0"/>
+    </body>
+
+    <!-- Cubes on table -->
+    <body name="green_cube" pos="0.45  0.18 0.825">
+      <geom type="box" size="0.025 0.025 0.025" material="mat_green" contype="1" conaffinity="1" density="300"/>
+    </body>
+    <body name="blue_cube" pos="0.45 -0.18 0.825">
+      <geom type="box" size="0.025 0.025 0.025" material="mat_blue" contype="1" conaffinity="1" density="300"/>
+    </body>
+
+    <!-- ROBOT MOUNTED ON TABLE TOP -->
+    <body name="gen3_mount" pos="0 0 {TABLE_TOP_Z}">
+{_indent(body_children, 6)}
+    </body>
+  </worldbody>
+</mujoco>
+"""
+    Path(scene_path).write_text(scene_xml, encoding="utf-8")
+    print("[DEBUG] scene_path =", scene_path)
+
+    # 4) Load the scene
+    model = mujoco.MjModel.from_xml_path(scene_path)
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
 
-    # Arm joints
+    # -------------------------
+    # Wrist camera body (if present)
+    # -------------------------
+    CAM_NAMES = [
+        "wrist_mounted_camera_color_optical_frame",
+        "wrist_mounted_camera_depth_optical_frame",
+        "wrist_camera_link",
+    ]
+    cam_body_id = -1
+    cam_body_name = None
+    for nm in CAM_NAMES:
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, nm)
+        if bid >= 0:
+            cam_body_id = int(bid)
+            cam_body_name = nm
+            break
+    if cam_body_id >= 0:
+        print(f"[INFO] Using wrist camera frame body: {cam_body_name}")
+    else:
+        print("[WARN] Wrist camera frame body not found. Falling back to bracelet+offset.")
+
+    # -------------------------
+    # Arm joints + EEF body
+    # -------------------------
     arm_joint_names = [f"gen3_joint_{i}" for i in range(1, 8)]
     arm_joint_ids = _get_joint_ids_by_name(model, arm_joint_names)
     qpos_adrs = [int(model.jnt_qposadr[j]) for j in arm_joint_ids]
     dof_adrs = [int(model.jnt_dofadr[j]) for j in arm_joint_ids]
 
-    # EEF body
     ee_body_id, ee_name = find_ee_target(model)
     print(f"[INFO] Using end-effector body '{ee_name}' (id={ee_body_id})")
 
-    # Gripper controls
     grip_controls, lo_m, hi_m = build_gripper_controls(model)
 
-    # Timing / IK
+    bracelet_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "gen3_bracelet_link")
+    if bracelet_body_id < 0:
+        raise RuntimeError("Could not find body 'gen3_bracelet_link' (needed for wrist camera fallback).")
+    bracelet_body_id = int(bracelet_body_id)
+
+    cam_off = np.array([0.0, -0.06841, -0.05044], dtype=float)
+    cam_rpy = np.array([0.0, 1.7444444444444447, -1.5708], dtype=float)
+
+    def R_from_rpy(rpy: np.ndarray) -> np.ndarray:
+        r, p, y = float(rpy[0]), float(rpy[1]), float(rpy[2])
+        cr, sr = np.cos(r), np.sin(r)
+        cp, sp = np.cos(p), np.sin(p)
+        cy, sy = np.cos(y), np.sin(y)
+        Rx = np.array([[1, 0, 0],
+                       [0, cr, -sr],
+                       [0, sr,  cr]], dtype=float)
+        Ry = np.array([[ cp, 0, sp],
+                       [  0, 1,  0],
+                       [-sp, 0, cp]], dtype=float)
+        Rz = np.array([[cy, -sy, 0],
+                       [sy,  cy, 0],
+                       [ 0,   0, 1]], dtype=float)
+        return Rz @ Ry @ Rx
+
+    R_cam_in_bracelet = R_from_rpy(cam_rpy)
+
+    renderer = None
+    if cv2 is None:
+        print("[WARN] opencv-python not installed; wrist camera window disabled.")
+    else:
+        renderer = mujoco.Renderer(model, width=640, height=480)
+
+    # -------------------------
+    # IK timing
+    # -------------------------
     dt = 1.0 / 60.0
     IK_ITERS = 10
-
-    # NEW: Safe joint speed limit = 10 deg/s for all 7 joints
-    qd_safe = np.deg2rad(10.0)  # rad/s
+    qd_safe = np.deg2rad(10.0)
     qd_max = np.full(7, qd_safe, dtype=float)
-    dt_inner = dt / IK_ITERS  # per-IK-iteration timestep for clamping
+    dt_inner = dt / IK_ITERS
 
-    # Waypoints
-    p0, q0 = get_body_pose(model, data, ee_body_id)
+    # -------------------------
+    # Pick & place curve (green -> blue)
+    # -------------------------
+    p_green = np.array([0.45, 0.18, 0.825], dtype=float)
+    p_blue = np.array([0.45, -0.18, 0.825], dtype=float)
 
-    def offset_pose(dp: np.ndarray, yaw_deg: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
-        yaw = np.deg2rad(yaw_deg)
-        cy, sy = np.cos(yaw * 0.5), np.sin(yaw * 0.5)
-        q_yaw = np.array([cy, 0.0, 0.0, sy], dtype=float)
-        return p0 + dp, quat_mul(q_yaw, q0)
+    z_above = 0.98
+    z_pick = 0.86
 
-    DX, DY, DZ = 0.26, 0.20, 0.14  # meters
+    R0 = data.xmat[ee_body_id].reshape(3, 3).copy()
+    R_des, k_up = make_R_with_axis_k_down(R0)
+    q_hold = quat_from_mat3(R_des)
+    print(f"[INFO] EE axis pointing up at start was body axis index {k_up} (0=x,1=y,2=z). Forcing it to point down.")
 
-    waypoints = [
-        (*offset_pose(np.array([0.00, 0.00, 0.00]), 0.0),    1.2,  0),
-        (*offset_pose(np.array([DX,   0.00, 0.00]), 20.0),   2.0, +1),
-        (*offset_pose(np.array([DX,   DY,   0.00]), 0.0),    2.0,  0),
-        (*offset_pose(np.array([0.00, DY,   0.00]), -20.0),  2.0, -1),
-        (*offset_pose(np.array([0.00, 0.00, DZ  ]), 0.0),    2.0,  0),
-        (*offset_pose(np.array([DX*0.6, DY*0.3, DZ]), 10.0), 2.0, +1),
-        (*offset_pose(np.array([0.00, 0.00, 0.00]), 0.0),    2.0,  0),
+    def bezier(p0, p1, p2, p3, s):
+        s = float(s)
+        return ((1 - s) ** 3) * p0 + 3 * ((1 - s) ** 2) * s * p1 + 3 * (1 - s) * (s ** 2) * p2 + (s ** 3) * p3
+
+    pA0 = np.array([p_green[0], p_green[1], z_above], dtype=float)
+    pA1 = np.array([p_green[0], p_green[1], z_pick], dtype=float)
+    pA2 = np.array([p_green[0], p_green[1], z_above], dtype=float)
+
+    pB0 = np.array([p_blue[0], p_blue[1], z_above], dtype=float)
+    pB1 = np.array([p_blue[0], p_blue[1], z_pick], dtype=float)
+    pB2 = np.array([p_blue[0], p_blue[1], z_above], dtype=float)
+
+    mid_z = 1.10
+    c1 = np.array([p_green[0], 0.00, mid_z], dtype=float)
+    c2 = np.array([p_blue[0], 0.00, mid_z], dtype=float)
+
+    segments = [
+        ("lin", pA0, pA0, 1.0, 0),
+        ("lin", pA0, pA1, 1.2, 0),
+        ("lin", pA1, pA1, 0.8, -1),
+        ("lin", pA1, pA2, 1.2, 0),
+        ("bez", pA2, c1, c2, pB0, 2.4, 0),
+        ("lin", pB0, pB1, 1.2, 0),
+        ("lin", pB1, pB1, 0.8, +1),
+        ("lin", pB1, pB2, 1.0, 0),
+        ("bez", pB2, c2, c1, pA0, 2.4, 0),
     ]
 
-    # Gripper open fraction g in [0,1]
     g = 0.8
-    GRIP_SPEED = 0.9  # g units per second
+    GRIP_SPEED = 0.9
 
     with mujoco.viewer.launch_passive(model, data) as viewer:
         viewer.cam.distance *= 1.8
         viewer.cam.elevation = -20
         viewer.cam.azimuth = 135
+        set_white_environment_visuals(model, viewer)
 
         next_step_time = time.perf_counter()
 
         try:
             while viewer.is_running():
-                for seg in range(len(waypoints)):
-                    pA, qA, TA, cmdA = waypoints[seg]
-                    pB, qB, _, _ = waypoints[(seg + 1) % len(waypoints)]
+                for seg in segments:
+                    kind = seg[0]
 
-                    T = float(TA)
-                    n = max(2, int(np.ceil(T / dt)))
+                    if kind == "lin":
+                        _, p0, p1, T, cmd = seg
+                        T = float(T)
+                        n = max(2, int(np.ceil(T / dt)))
 
-                    for i in range(n):
-                        if not viewer.is_running():
-                            break
-
-                        s = i / (n - 1)
-                        p_des = (1.0 - s) * pA + s * pB
-                        q_des = quat_slerp(qA, qB, s)
-
-                        # Gripper update (3-phase): +1 open, -1 close, 0 hold
-                        g += float(cmdA) * GRIP_SPEED * dt
-                        g = float(np.clip(g, 0.0, 1.0))
-                        apply_gripper(model, data, grip_controls, lo_m, hi_m, g)
-
-                        # IK with safe speed-limited joint steps
-                        for _ in range(IK_ITERS):
-                            err = ik_step_dls(
-                                model, data, ee_body_id,
-                                arm_joint_ids, qpos_adrs, dof_adrs,
-                                p_des, q_des,
-                                dt_step=dt_inner,
-                                qd_max=qd_max,
-                            )
-                            if err < 1e-4:
+                        for i in range(n):
+                            if not viewer.is_running():
                                 break
 
-                        viewer.sync()
+                            s = i / (n - 1)
+                            p_des = (1.0 - s) * p0 + s * p1
+                            q_des = q_hold
 
-                        # stable pacing (no drift)
-                        next_step_time += dt
-                        sleep_s = next_step_time - time.perf_counter()
-                        if sleep_s > 0:
-                            time.sleep(sleep_s)
+                            g += float(cmd) * GRIP_SPEED * dt
+                            g = float(np.clip(g, 0.0, 1.0))
+                            apply_gripper(model, data, grip_controls, lo_m, hi_m, g)
+
+                            for _ in range(IK_ITERS):
+                                err = ik_step_dls(
+                                    model, data, ee_body_id,
+                                    arm_joint_ids, qpos_adrs, dof_adrs,
+                                    p_des, q_des,
+                                    rot_w=2.0,
+                                    damping=3e-2,
+                                    dt_step=dt_inner,
+                                    qd_max=qd_max,
+                                )
+                                if err < 1e-4:
+                                    break
+
+                            viewer.sync()
+
+                            if renderer is not None:
+                                # ---- Wrist camera POSITION from URDF offset (bracelet + cam_off) ----
+                                p_b = data.xpos[bracelet_body_id].copy()
+                                R_b = data.xmat[bracelet_body_id].reshape(3, 3).copy()
+                                p_frame = p_b + R_b @ cam_off
+
+                                # ---- Orientation: follow gripper/tool direction ----
+                                # Use EE orientation so view aligns with gripper pointing direction
+                                R_frame = data.xmat[ee_body_id].reshape(3, 3).copy()
+
+                                # move camera origin outward so it’s not inside the wrist camera mesh
+                                eye_out = 0.035  # 3.5 cm outward from mount point (tune 0.02~0.06)
+                                eye_up = 0.008  # 8 mm upward (optional)
+
+                                # tool-forward axis in the chosen frame (here: EE frame)
+                                tool_forward = np.array([1.0, 0.0, 0.0])  # or whatever you’re using
+                                tool_up = np.array([0.0, 0.0, 1.0])
+
+                                p_frame = p_frame + (R_frame @ (tool_forward * eye_out)) + (
+                                            R_frame @ (tool_up * eye_up))
+
+                                cam = make_free_camera_from_frame_pose(
+                                    p_frame, R_frame,
+                                    # Gripper/tool axis: your print said index 0 was "up" initially -> likely X is tool axis.
+                                    optical_forward=np.array([0.0, 1.0, 0.0]),  # try [-1,0,0] if backwards
+                                    optical_up=np.array([0.0, 0.0, 1.0]),  # try [0,-1,0] if rotated
+                                    look_ahead=0.20,
+                                    cam_back=0.02,
+                                    keep_claws_down_bias=0.00,
+                                    distance=0.20,
+                                )
+                                renderer.update_scene(data, camera=cam)
+                                wrist_rgb = renderer.render()
+                                show_wrist_window(wrist_rgb, title="Wrist Camera (Aligned)", w=480, h=360)
+
+                            next_step_time += dt
+                            sleep_s = next_step_time - time.perf_counter()
+                            if sleep_s > 0:
+                                time.sleep(sleep_s)
+
+                    elif kind == "bez":
+                        _, p0, p1, p2, p3, T, cmd = seg
+                        T = float(T)
+                        n = max(2, int(np.ceil(T / dt)))
+
+                        for i in range(n):
+                            if not viewer.is_running():
+                                break
+
+                            s = i / (n - 1)
+                            p_des = bezier(p0, p1, p2, p3, s)
+                            q_des = q_hold
+
+                            g += float(cmd) * GRIP_SPEED * dt
+                            g = float(np.clip(g, 0.0, 1.0))
+                            apply_gripper(model, data, grip_controls, lo_m, hi_m, g)
+
+                            for _ in range(IK_ITERS):
+                                err = ik_step_dls(
+                                    model, data, ee_body_id,
+                                    arm_joint_ids, qpos_adrs, dof_adrs,
+                                    p_des, q_des,
+                                    rot_w=2.0,
+                                    damping=3e-2,
+                                    dt_step=dt_inner,
+                                    qd_max=qd_max,
+                                )
+                                if err < 1e-4:
+                                    break
+
+                            viewer.sync()
+
+                            if renderer is not None:
+                                # ---- Wrist camera POSITION from URDF offset (bracelet + cam_off) ----
+                                p_b = data.xpos[bracelet_body_id].copy()
+                                R_b = data.xmat[bracelet_body_id].reshape(3, 3).copy()
+                                p_frame = p_b + R_b @ cam_off
+
+                                # ---- Orientation: follow gripper/tool direction ----
+                                # Use EE orientation so view aligns with gripper pointing direction
+                                R_frame = data.xmat[ee_body_id].reshape(3, 3).copy()
+
+                                # move camera origin outward so it’s not inside the wrist camera mesh
+                                eye_out = 0.035  # 3.5 cm outward from mount point (tune 0.02~0.06)
+                                eye_up = 0.008  # 8 mm upward (optional)
+
+                                # tool-forward axis in the chosen frame (here: EE frame)
+                                tool_forward = np.array([1.0, 0.0, 0.0])  # or whatever you’re using
+                                tool_up = np.array([0.0, 0.0, 1.0])
+
+                                p_frame = p_frame + (R_frame @ (tool_forward * eye_out)) + (
+                                            R_frame @ (tool_up * eye_up))
+
+                                cam = make_free_camera_from_frame_pose(
+                                    p_frame, R_frame,
+                                    # Gripper/tool axis: your print said index 0 was "up" initially -> likely X is tool axis.
+                                    optical_forward=np.array([0.0, 1.0, 0.0]),  # try [-1,0,0] if backwards
+                                    optical_up=np.array([0.0, 0.0, 1.0]),  # try [0,-1,0] if rotated
+                                    look_ahead=0.20,
+                                    cam_back=0.02,
+                                    keep_claws_down_bias=0.00,
+                                    distance=0.20,
+                                )
+                                renderer.update_scene(data, camera=cam)
+                                wrist_rgb = renderer.render()
+                                show_wrist_window(wrist_rgb, title="Wrist Camera (Aligned)", w=480, h=360)
+
+                            next_step_time += dt
+                            sleep_s = next_step_time - time.perf_counter()
+                            if sleep_s > 0:
+                                time.sleep(sleep_s)
 
         except KeyboardInterrupt:
             pass
+        finally:
+            if cv2 is not None:
+                cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mujoco model="robosuite_arena_only">
+  <compiler angle="radian" meshdir="meshes/"/>
+
+  <option impratio="20" density="1.2" viscosity="2e-05" cone="elliptic"/>
+  <size njmax="5000" nconmax="5000"/>
+
+  <visual>
+    <map znear="0.001"/>
+  </visual>
+
+  <asset>
+    <!-- Skybox -->
+    <texture type="skybox" colorspace="auto" builtin="gradient"
+             rgb1="0.9 0.9 1" rgb2="0.2 0.3 0.4" width="256" height="1536"/>
+
+    <!-- Arena textures -->
+    <texture type="2d" colorspace="sRGB" name="texplane"
+             file="D:\mujoco_simulation/robosuite/models/assets/textures/light-gray-floor-tile.png"/>
+    <texture type="cube" colorspace="linear" name="tex-ceramic"
+             file="D:\mujoco_simulation/robosuite/models/assets/textures/ceramic.png"/>
+    <texture type="cube" colorspace="linear" name="tex-steel-brushed"
+             file="D:\mujoco_simulation/robosuite/models/assets/textures/steel-brushed.png"/>
+    <texture type="2d" colorspace="linear" name="tex-light-gray-plaster"
+             file="D:\mujoco_simulation/robosuite/models/assets/textures/light-gray-plaster.png"/>
+
+    <!-- Materials -->
+    <material name="floorplane" texture="texplane" texuniform="true" texrepeat="2 2"
+              specular="0" shininess="0" reflectance="0.01"/>
+    <material name="table_ceramic" texture="tex-ceramic" specular="0.2" shininess="0"/>
+    <material name="table_legs_metal" texture="tex-steel-brushed" shininess="0.8" reflectance="0.8"/>
+    <material name="walls_mat" texture="tex-light-gray-plaster" texuniform="true" texrepeat="3 3"
+              specular="0.1" shininess="0.1"/>
+  </asset>
+
+  <worldbody>
+    <!-- Floor -->
+    <geom name="floor" size="3 3 0.125" type="plane" group="1" material="floorplane"/>
+
+    <!-- Walls (visual only) -->
+    <geom name="wall_leftcorner_visual"  size="1.06 1.5 0.01" pos="-1.25  2.25 1.5"
+          quat="0.653281 0.653281 0.270598 0.270598" type="box" contype="0" conaffinity="0"
+          group="1" material="walls_mat"/>
+    <geom name="wall_rightcorner_visual" size="1.06 1.5 0.01" pos="-1.25 -2.25 1.5"
+          quat="0.653281 0.653281 -0.270598 -0.270598" type="box" contype="0" conaffinity="0"
+          group="1" material="walls_mat"/>
+    <geom name="wall_left_visual"  size="1.75 1.5 0.01" pos=" 1.25  3.0 1.5"
+          quat="0.707107 0.707107 0 0" type="box" contype="0" conaffinity="0"
+          group="1" material="walls_mat"/>
+    <geom name="wall_right_visual" size="1.75 1.5 0.01" pos=" 1.25 -3.0 1.5"
+          quat="0.707107 -0.707107 0 0" type="box" contype="0" conaffinity="0"
+          group="1" material="walls_mat"/>
+    <geom name="wall_rear_visual"  size="1.5 1.5 0.01" pos="-2.0  0.0 1.5"
+          quat="0.5 0.5 0.5 0.5" type="box" contype="0" conaffinity="0"
+          group="1" material="walls_mat"/>
+    <geom name="wall_front_visual" size="3.0 1.5 0.01" pos=" 3.0  0.0 1.5"
+          quat="0.5 0.5 -0.5 -0.5" type="box" contype="0" conaffinity="0"
+          group="1" material="walls_mat"/>
+
+    <!-- Cameras (optional) -->
+    <camera name="frontview" pos="1.6 0 1.45" quat="0.560842 0.430646 0.430646 0.560842"/>
+    <camera name="birdview"  pos="-0.2 0 3"  quat="0.707107 0 0 0.707107"/>
+    <camera name="agentview" pos="0.5 0 1.35" quat="0.653098 0.271041 0.271041 0.653098"/>
+    <camera name="sideview"  pos="-0.0565177 1.27612 1.48796" quat="0.00990507 0.00687796 0.591223 0.806418"/>
+
+    <!-- Light -->
+    <light pos="1 1 1.5" dir="-0.19245 -0.19245 -0.96225" type="directional" castshadow="false"/>
+
+    <!-- Table -->
+    <body name="table" pos="0 0 0.775">
+      <!-- Collision top -->
+      <geom name="table_collision" size="0.4 0.4 0.025" type="box" rgba="0.5 0.5 0 1"/>
+      <!-- Visual top -->
+      <geom name="table_visual" size="0.4 0.4 0.025" type="box"
+            contype="0" conaffinity="0" group="1" material="table_ceramic"/>
+      <!-- Legs (visual only) -->
+      <geom name="table_leg1_visual" size="0.025 0.3875" pos=" 0.3  0.3 -0.3875" type="cylinder"
+            contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
+      <geom name="table_leg2_visual" size="0.025 0.3875" pos="-0.3  0.3 -0.3875" type="cylinder"
+            contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
+      <geom name="table_leg3_visual" size="0.025 0.3875" pos="-0.3 -0.3 -0.3875" type="cylinder"
+            contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
+      <geom name="table_leg4_visual" size="0.025 0.3875" pos=" 0.3 -0.3 -0.3875" type="cylinder"
+            contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
+
+      <!-- Handy marker: table top center (world z = 0.775 + 0.025 = 0.800) -->
+      <site name="table_top" pos="0 0 0.025" size="0.001" rgba="0 0 0 0"/>
+    </body>
+  </worldbody>
+</mujoco>
