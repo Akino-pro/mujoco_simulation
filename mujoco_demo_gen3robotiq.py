@@ -99,7 +99,8 @@ def main():
     body_children  = _ensure_nonempty_body_children(worldbody_inner)
 
     # 3) Build the scene MJCF (assets + bodies INLINED)
-    scene_path = os.path.join(urdf_dir, "_gen3_scene_with_cubes.xml")
+    #scene_path = os.path.join(urdf_dir, "_gen3_scene_with_cubes.xml")
+    scene_path = os.path.join(urdf_dir, "robotsuit_cubes.xml")
 
     TABLE_TOP_Z = 0.800  # table top height (meters)
     scene_xml = f"""<?xml version="1.0" encoding="utf-8"?>
@@ -158,13 +159,17 @@ def main():
   </worldbody>
 </mujoco>
 """
-    Path(scene_path).write_text(scene_xml, encoding="utf-8")
-    print("[DEBUG] scene_path =", scene_path)
+    #Path(scene_path).write_text(scene_xml, encoding="utf-8")
+    #print("[DEBUG] scene_path =", scene_path)
 
     # 4) Load the scene
     model = mujoco.MjModel.from_xml_path(scene_path)
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
+    wrist_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_rgb")
+    if wrist_cam_id < 0:
+        raise RuntimeError("Camera 'wrist_rgb' not found in model (did you add it to the XML?)")
+    wrist_cam_id = int(wrist_cam_id)
 
     # -------------------------
     # Wrist camera body (if present)
@@ -225,6 +230,7 @@ def main():
         return Rz @ Ry @ Rx
 
     R_cam_in_bracelet = R_from_rpy(cam_rpy)
+
 
     renderer = None
     if cv2 is None:
@@ -332,6 +338,56 @@ def main():
                             viewer.sync()
 
                             if renderer is not None:
+                                # ====== SAME POSITION AS BEFORE ======
+                                p_b = data.xpos[bracelet_body_id].copy()
+                                R_b = data.xmat[bracelet_body_id].reshape(3, 3).copy()
+                                p_frame = p_b + R_b @ cam_off
+
+                                R_frame = data.xmat[ee_body_id].reshape(3,
+                                                                        3).copy()  # in your case ee is bracelet anyway
+
+                                eye_out = 0.035
+                                eye_up = 0.008
+
+                                tool_forward = np.array([0.0, 0.0, -1.0], dtype=float)
+                                tool_up = np.array([0.0, -1.0, 0.0], dtype=float)
+
+                                p_frame = p_frame + (R_frame @ (tool_forward * eye_out)) + (
+                                            R_frame @ (tool_up * eye_up))
+
+                                # ====== ORIENTATION THAT PRESERVES ROLL (NO "UP STABILIZATION") ======
+                                def _normalize(v):
+                                    n = np.linalg.norm(v)
+                                    if n < 1e-9:
+                                        return v
+                                    return v / n
+
+                                f_world = _normalize(R_frame @ tool_forward)  # where the tool points in world
+                                u_world = _normalize(R_frame @ tool_up)  # tool-up in world (this carries the roll)
+
+                                # MuJoCo camera looks along -Z, so z_cam_world should be -forward
+                                z_cam_world = _normalize(-f_world)
+
+                                # make y_cam_world as close to u_world as possible but orthogonal to z
+                                y_cam_world = _normalize(u_world - np.dot(u_world, z_cam_world) * z_cam_world)
+
+                                # x = y × z  (right-handed)
+                                x_cam_world = _normalize(np.cross(y_cam_world, z_cam_world))
+
+                                # Re-orthogonalize y to be safe
+                                y_cam_world = _normalize(np.cross(z_cam_world, x_cam_world))
+
+                                R_wc = np.column_stack([x_cam_world, y_cam_world, z_cam_world])  # world_from_cam
+
+                                # Write camera pose (this keeps roll!)
+                                model.cam_pos[wrist_cam_id] = p_frame
+                                model.cam_quat[wrist_cam_id] = quat_from_mat3(R_wc)  # must output [w,x,y,z]
+
+                                renderer.update_scene(data, camera="wrist_rgb")
+                                wrist_rgb = renderer.render()
+                                show_wrist_window(wrist_rgb, title="Wrist Camera (roll preserved)", w=480, h=360)
+
+                                """
                                 # ---- Wrist camera POSITION from URDF offset (bracelet + cam_off) ----
                                 p_b = data.xpos[bracelet_body_id].copy()
                                 R_b = data.xmat[bracelet_body_id].reshape(3, 3).copy()
@@ -365,6 +421,7 @@ def main():
                                 renderer.update_scene(data, camera=cam)
                                 wrist_rgb = renderer.render()
                                 show_wrist_window(wrist_rgb, title="Wrist Camera (Aligned)", w=480, h=360)
+                                """
 
                             next_step_time += dt
                             sleep_s = next_step_time - time.perf_counter()
@@ -404,6 +461,55 @@ def main():
                             viewer.sync()
 
                             if renderer is not None:
+                                # ====== SAME POSITION AS BEFORE ======
+                                p_b = data.xpos[bracelet_body_id].copy()
+                                R_b = data.xmat[bracelet_body_id].reshape(3, 3).copy()
+                                p_frame = p_b + R_b @ cam_off
+
+                                R_frame = data.xmat[ee_body_id].reshape(3,
+                                                                        3).copy()  # in your case ee is bracelet anyway
+
+                                eye_out = 0.035
+                                eye_up = 0.008
+
+                                tool_forward = np.array([0.0, 0.0, -1.0], dtype=float)
+                                tool_up = np.array([0.0, -1.0, 0.0], dtype=float)
+
+                                p_frame = p_frame + (R_frame @ (tool_forward * eye_out)) + (
+                                            R_frame @ (tool_up * eye_up))
+
+                                # ====== ORIENTATION THAT PRESERVES ROLL (NO "UP STABILIZATION") ======
+                                def _normalize(v):
+                                    n = np.linalg.norm(v)
+                                    if n < 1e-9:
+                                        return v
+                                    return v / n
+
+                                f_world = _normalize(R_frame @ tool_forward)  # where the tool points in world
+                                u_world = _normalize(R_frame @ tool_up)  # tool-up in world (this carries the roll)
+
+                                # MuJoCo camera looks along -Z, so z_cam_world should be -forward
+                                z_cam_world = _normalize(-f_world)
+
+                                # make y_cam_world as close to u_world as possible but orthogonal to z
+                                y_cam_world = _normalize(u_world - np.dot(u_world, z_cam_world) * z_cam_world)
+
+                                # x = y × z  (right-handed)
+                                x_cam_world = _normalize(np.cross(y_cam_world, z_cam_world))
+
+                                # Re-orthogonalize y to be safe
+                                y_cam_world = _normalize(np.cross(z_cam_world, x_cam_world))
+
+                                R_wc = np.column_stack([x_cam_world, y_cam_world, z_cam_world])  # world_from_cam
+
+                                # Write camera pose (this keeps roll!)
+                                model.cam_pos[wrist_cam_id] = p_frame
+                                model.cam_quat[wrist_cam_id] = quat_from_mat3(R_wc)  # must output [w,x,y,z]
+
+                                renderer.update_scene(data, camera="wrist_rgb")
+                                wrist_rgb = renderer.render()
+                                show_wrist_window(wrist_rgb, title="Wrist Camera (roll preserved)", w=480, h=360)
+                                """
                                 # ---- Wrist camera POSITION from URDF offset (bracelet + cam_off) ----
                                 p_b = data.xpos[bracelet_body_id].copy()
                                 R_b = data.xmat[bracelet_body_id].reshape(3, 3).copy()
@@ -437,6 +543,7 @@ def main():
                                 renderer.update_scene(data, camera=cam)
                                 wrist_rgb = renderer.render()
                                 show_wrist_window(wrist_rgb, title="Wrist Camera (Aligned)", w=480, h=360)
+                                """
 
                             next_step_time += dt
                             sleep_s = next_step_time - time.perf_counter()
