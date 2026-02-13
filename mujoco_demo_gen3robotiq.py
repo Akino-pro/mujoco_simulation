@@ -23,7 +23,7 @@ import mujoco.viewer
 from helper_functions import (
     _get_joint_ids_by_name, find_ee_target, build_gripper_controls, quat_from_mat3,
     set_white_environment_visuals, ik_step_dls, apply_gripper, show_wrist_window,
-    make_R_with_axis_k_down, make_free_camera_from_frame_pose
+    make_R_with_axis_k_down, make_free_camera_from_frame_pose, draw_body_frame_in_viewer
 )
 
 try:
@@ -328,7 +328,7 @@ def main():
                                 )
                                 if err < 1e-4:
                                     break
-
+                            #draw_body_frame_in_viewer(viewer, data, ee_body_id, length=0.12, radius=0.003)
                             viewer.sync()
 
                             if renderer is not None:
@@ -346,8 +346,8 @@ def main():
                                 eye_up = 0.008  # 8 mm upward (optional)
 
                                 # tool-forward axis in the chosen frame (here: EE frame)
-                                tool_forward = np.array([1.0, 0.0, 0.0])  # or whatever you’re using
-                                tool_up = np.array([0.0, 0.0, 1.0])
+                                tool_forward = np.array([0.0, 0.0, -1.0])  # or whatever you’re using
+                                tool_up = np.array([0.0, -1.0, 0.0])
 
                                 p_frame = p_frame + (R_frame @ (tool_forward * eye_out)) + (
                                             R_frame @ (tool_up * eye_up))
@@ -355,8 +355,8 @@ def main():
                                 cam = make_free_camera_from_frame_pose(
                                     p_frame, R_frame,
                                     # Gripper/tool axis: your print said index 0 was "up" initially -> likely X is tool axis.
-                                    optical_forward=np.array([0.0, 1.0, 0.0]),  # try [-1,0,0] if backwards
-                                    optical_up=np.array([0.0, 0.0, 1.0]),  # try [0,-1,0] if rotated
+                                    optical_forward=tool_forward,  # try [-1,0,0] if backwards
+                                    optical_up= tool_up,  # try [0,-1,0] if rotated
                                     look_ahead=0.20,
                                     cam_back=0.02,
                                     keep_claws_down_bias=0.00,
@@ -400,7 +400,7 @@ def main():
                                 )
                                 if err < 1e-4:
                                     break
-
+                            #draw_body_frame_in_viewer(viewer, data, ee_body_id, length=0.12, radius=0.003)
                             viewer.sync()
 
                             if renderer is not None:
@@ -415,11 +415,11 @@ def main():
 
                                 # move camera origin outward so it’s not inside the wrist camera mesh
                                 eye_out = 0.035  # 3.5 cm outward from mount point (tune 0.02~0.06)
-                                eye_up = 0.008  # 8 mm upward (optional)
+                                eye_up = 0  # 8 mm upward (optional)
 
                                 # tool-forward axis in the chosen frame (here: EE frame)
-                                tool_forward = np.array([1.0, 0.0, 0.0])  # or whatever you’re using
-                                tool_up = np.array([0.0, 0.0, 1.0])
+                                tool_forward = np.array([0.0, 0, -1.0])  # or whatever you’re using
+                                tool_up = np.array([0.0, -1.0, 0.0])
 
                                 p_frame = p_frame + (R_frame @ (tool_forward * eye_out)) + (
                                             R_frame @ (tool_up * eye_up))
@@ -427,8 +427,8 @@ def main():
                                 cam = make_free_camera_from_frame_pose(
                                     p_frame, R_frame,
                                     # Gripper/tool axis: your print said index 0 was "up" initially -> likely X is tool axis.
-                                    optical_forward=np.array([0.0, 1.0, 0.0]),  # try [-1,0,0] if backwards
-                                    optical_up=np.array([0.0, 0.0, 1.0]),  # try [0,-1,0] if rotated
+                                    optical_forward=tool_forward,  # try [-1,0,0] if backwards
+                                    optical_up=tool_up,  # try [0,-1,0] if rotated
                                     look_ahead=0.20,
                                     cam_back=0.02,
                                     keep_claws_down_bias=0.00,

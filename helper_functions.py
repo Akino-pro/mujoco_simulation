@@ -870,3 +870,54 @@ def geom_world_min_z(model: mujoco.MjModel, data: mujoco.MjData, gid: int) -> fl
     world = p + R @ local
     return float(world[2])
 
+import numpy as np
+import mujoco
+
+import numpy as np
+import mujoco
+
+def draw_body_frame_in_viewer(viewer, data, body_id: int, length=0.10, radius=0.004):
+    """
+    Draw XYZ axes of a MuJoCo body frame as 3 capsules in the viewer overlay.
+    X=red, Y=green, Z=blue.
+    """
+    scn = viewer.user_scn
+    scn.ngeom = 0  # clear overlay geoms each frame
+
+    p = np.array(data.xpos[body_id], dtype=np.float64)
+    R = np.array(data.xmat[body_id], dtype=np.float64).reshape(3, 3)
+
+    px = p + R[:, 0] * float(length)
+    py = p + R[:, 1] * float(length)
+    pz = p + R[:, 2] * float(length)
+
+    def _add_capsule(p0, p1, rgba):
+        if scn.ngeom >= scn.maxgeom:
+            return
+        g = scn.geoms[scn.ngeom]
+
+        mujoco.mjv_initGeom(
+            g,
+            mujoco.mjtGeom.mjGEOM_CAPSULE,
+            np.array([radius, 0.0, 0.0], dtype=np.float64),
+            np.zeros(3, dtype=np.float64),
+            np.eye(3, dtype=np.float64).ravel(),
+            np.array(rgba, dtype=np.float32),
+        )
+
+        # Your mujoco build expects: (geom, type, width, from_, to)
+        mujoco.mjv_connector(
+            g,
+            mujoco.mjtGeom.mjGEOM_CAPSULE,
+            float(radius),
+            np.asarray(p0, dtype=np.float64),
+            np.asarray(p1, dtype=np.float64),
+        )
+
+        scn.ngeom += 1
+
+    _add_capsule(p, px, [1, 0, 0, 1])  # X
+    _add_capsule(p, py, [0, 1, 0, 1])  # Y
+    _add_capsule(p, pz, [0, 0, 1, 1])  # Z
+
+
