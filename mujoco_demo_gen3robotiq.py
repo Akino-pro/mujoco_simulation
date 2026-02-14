@@ -346,8 +346,8 @@ def main():
                                 R_frame = data.xmat[ee_body_id].reshape(3,
                                                                         3).copy()  # in your case ee is bracelet anyway
 
-                                eye_out = 0.035
-                                eye_up = 0.008
+                                eye_out = 0.01
+                                eye_up =0
 
                                 tool_forward = np.array([0.0, 0.0, -1.0], dtype=float)
                                 tool_up = np.array([0.0, -1.0, 0.0], dtype=float)
@@ -385,7 +385,7 @@ def main():
 
                                 renderer.update_scene(data, camera="wrist_rgb")
                                 wrist_rgb = renderer.render()
-                                show_wrist_window(wrist_rgb, title="Wrist Camera (roll preserved)", w=480, h=360)
+                                show_wrist_window(wrist_rgb, title="Wrist Camera (roll preserved)", w=480, h=480)
 
                                 """
                                 # ---- Wrist camera POSITION from URDF offset (bracelet + cam_off) ----
@@ -469,8 +469,8 @@ def main():
                                 R_frame = data.xmat[ee_body_id].reshape(3,
                                                                         3).copy()  # in your case ee is bracelet anyway
 
-                                eye_out = 0.035
-                                eye_up = 0.008
+                                eye_out = 0.01
+                                eye_up = 0
 
                                 tool_forward = np.array([0.0, 0.0, -1.0], dtype=float)
                                 tool_up = np.array([0.0, -1.0, 0.0], dtype=float)
@@ -508,7 +508,7 @@ def main():
 
                                 renderer.update_scene(data, camera="wrist_rgb")
                                 wrist_rgb = renderer.render()
-                                show_wrist_window(wrist_rgb, title="Wrist Camera (roll preserved)", w=480, h=360)
+                                show_wrist_window(wrist_rgb, title="Wrist Camera (roll preserved)", w=480, h=480)
                                 """
                                 # ---- Wrist camera POSITION from URDF offset (bracelet + cam_off) ----
                                 p_b = data.xpos[bracelet_body_id].copy()
