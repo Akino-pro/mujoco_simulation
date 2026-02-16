@@ -102,63 +102,6 @@ def main():
     #scene_path = os.path.join(urdf_dir, "_gen3_scene_with_cubes.xml")
     scene_path = os.path.join(urdf_dir, "robotsuit_cubes.xml")
 
-    TABLE_TOP_Z = 0.800  # table top height (meters)
-    scene_xml = f"""<?xml version="1.0" encoding="utf-8"?>
-<mujoco model="gen3_scene">
-  <compiler angle="radian" autolimits="true"/>
-  <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
-
-  <visual>
-    <global fovy="60"/>
-    <map znear="0.001"/>
-  </visual>
-
-  <asset>
-    <!-- scene materials -->
-    <material name="mat_green" rgba="0.10 0.90 0.10 1"/>
-    <material name="mat_blue"  rgba="0.10 0.30 0.95 1"/>
-    <material name="mat_gray"  rgba="0.85 0.85 0.85 1"/>
-    <material name="mat_table" rgba="0.90 0.90 0.90 1"/>
-    <material name="mat_leg"   rgba="0.25 0.25 0.25 1"/>
-
-    <!-- robot meshes/materials (INLINED) -->
-{_indent(asset_children, 4)}
-  </asset>
-
-  <worldbody>
-    <light pos="0.6 0.0 1.2" dir="-0.6 0 -1" directional="true" diffuse="1 1 1" ambient="0.4 0.4 0.4"/>
-    <light pos="0.0 0.6 1.0" dir="0 -0.6 -1" directional="true" diffuse="0.8 0.8 0.8" ambient="0.3 0.3 0.3"/>
-
-    <!-- Ground plane (visual only) -->
-    <geom name="bg_plane" type="plane" pos="0 0 -0.001" size="3 3 0.1"
-          material="mat_gray" rgba="1 1 1 1" contype="0" conaffinity="0"/>
-
-    <!-- Table: top surface at z = 0.800 -->
-    <body name="table" pos="0 0 0.775">
-      <geom name="table_collision" size="0.55 0.45 0.025" type="box" material="mat_table" contype="1" conaffinity="1"/>
-      <geom name="table_visual"    size="0.55 0.45 0.025" type="box" material="mat_table" contype="0" conaffinity="0" group="1"/>
-      <geom name="leg1" type="cylinder" size="0.02 0.38" pos=" 0.48  0.38 -0.38" material="mat_leg" contype="0" conaffinity="0" group="1"/>
-      <geom name="leg2" type="cylinder" size="0.02 0.38" pos="-0.48  0.38 -0.38" material="mat_leg" contype="0" conaffinity="0" group="1"/>
-      <geom name="leg3" type="cylinder" size="0.02 0.38" pos="-0.48 -0.38 -0.38" material="mat_leg" contype="0" conaffinity="0" group="1"/>
-      <geom name="leg4" type="cylinder" size="0.02 0.38" pos=" 0.48 -0.38 -0.38" material="mat_leg" contype="0" conaffinity="0" group="1"/>
-      <site name="table_top" pos="0 0 0.025" size="0.001" rgba="0 0 0 0"/>
-    </body>
-
-    <!-- Cubes on table -->
-    <body name="green_cube" pos="0.45  0.18 0.825">
-      <geom type="box" size="0.025 0.025 0.025" material="mat_green" contype="1" conaffinity="1" density="300"/>
-    </body>
-    <body name="blue_cube" pos="0.45 -0.18 0.825">
-      <geom type="box" size="0.025 0.025 0.025" material="mat_blue" contype="1" conaffinity="1" density="300"/>
-    </body>
-
-    <!-- ROBOT MOUNTED ON TABLE TOP -->
-    <body name="gen3_mount" pos="0 0 {TABLE_TOP_Z}">
-{_indent(body_children, 6)}
-    </body>
-  </worldbody>
-</mujoco>
-"""
     #Path(scene_path).write_text(scene_xml, encoding="utf-8")
     #print("[DEBUG] scene_path =", scene_path)
 
@@ -236,7 +179,7 @@ def main():
     if cv2 is None:
         print("[WARN] opencv-python not installed; wrist camera window disabled.")
     else:
-        renderer = mujoco.Renderer(model, width=640, height=480)
+        renderer = mujoco.Renderer(model, width=480, height=480)
 
     # -------------------------
     # IK timing
@@ -346,8 +289,9 @@ def main():
                                 R_frame = data.xmat[ee_body_id].reshape(3,
                                                                         3).copy()  # in your case ee is bracelet anyway
 
-                                eye_out = 0.035
-                                eye_up = 0.008
+                                #eye_out = 0.035
+                                eye_out = 0.01
+                                eye_up = 0.000
 
                                 tool_forward = np.array([0.0, 0.0, -1.0], dtype=float)
                                 tool_up = np.array([0.0, -1.0, 0.0], dtype=float)
@@ -385,7 +329,7 @@ def main():
 
                                 renderer.update_scene(data, camera="wrist_rgb")
                                 wrist_rgb = renderer.render()
-                                show_wrist_window(wrist_rgb, title="Wrist Camera (roll preserved)", w=480, h=360)
+                                show_wrist_window(wrist_rgb, title="Wrist Camera (roll preserved)", w=480, h=480)
 
                                 """
                                 # ---- Wrist camera POSITION from URDF offset (bracelet + cam_off) ----
@@ -469,8 +413,8 @@ def main():
                                 R_frame = data.xmat[ee_body_id].reshape(3,
                                                                         3).copy()  # in your case ee is bracelet anyway
 
-                                eye_out = 0.035
-                                eye_up = 0.008
+                                eye_out = 0.01
+                                eye_up = 0.0
 
                                 tool_forward = np.array([0.0, 0.0, -1.0], dtype=float)
                                 tool_up = np.array([0.0, -1.0, 0.0], dtype=float)
@@ -508,7 +452,7 @@ def main():
 
                                 renderer.update_scene(data, camera="wrist_rgb")
                                 wrist_rgb = renderer.render()
-                                show_wrist_window(wrist_rgb, title="Wrist Camera (roll preserved)", w=480, h=360)
+                                show_wrist_window(wrist_rgb, title="Wrist Camera (roll preserved)", w=480, h=480)
                                 """
                                 # ---- Wrist camera POSITION from URDF offset (bracelet + cam_off) ----
                                 p_b = data.xpos[bracelet_body_id].copy()

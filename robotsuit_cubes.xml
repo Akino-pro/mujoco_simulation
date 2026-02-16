@@ -7,7 +7,7 @@
   <size njmax="5000" nconmax="5000"/>
 
   <visual>
-    <global fovy="60"/>
+    <global offwidth="480" offheight="480" fovy="60"/>
     <map znear="0.001"/>
   </visual>
 
@@ -98,18 +98,18 @@
     <!-- Robosuite Table -->
     <body name="arena_table" pos="0 0 0.775">
       <!-- Collision top -->
-      <geom name="table_collision" size="0.4 0.4 0.025" type="box" rgba="0.5 0.5 0 1"/>
+      <geom name="table_collision" size="0.8 0.8 0.025" type="box" rgba="0.5 0.5 0 1"/>
       <!-- Visual top -->
-      <geom name="table_visual" size="0.4 0.4 0.025" type="box"
+      <geom name="table_visual" size="0.8 0.8 0.025" type="box"
             contype="0" conaffinity="0" group="1" material="table_ceramic"/>
       <!-- Legs (visual only) -->
-      <geom name="table_leg1_visual" size="0.025 0.3875" pos=" 0.3  0.3 -0.3875" type="cylinder"
+      <geom name="table_leg1_visual" size="0.025 0.3875" pos=" 0.7  0.7 -0.3875" type="cylinder"
             contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
-      <geom name="table_leg2_visual" size="0.025 0.3875" pos="-0.3  0.3 -0.3875" type="cylinder"
+      <geom name="table_leg2_visual" size="0.025 0.3875" pos=" -0.7  0.7 -0.3875" type="cylinder"
             contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
-      <geom name="table_leg3_visual" size="0.025 0.3875" pos="-0.3 -0.3 -0.3875" type="cylinder"
+      <geom name="table_leg3_visual" size="0.025 0.3875" pos=" -0.7  -0.7 -0.3875" type="cylinder"
             contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
-      <geom name="table_leg4_visual" size="0.025 0.3875" pos=" 0.3 -0.3 -0.3875" type="cylinder"
+      <geom name="table_leg4_visual" size="0.025 0.3875" pos=" 0.7  -0.7 -0.3875" type="cylinder"
             contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
 
       <!-- Handy marker: table top center (world z = 0.775 + 0.025 = 0.800) -->
@@ -118,10 +118,10 @@
 
     <!-- ================= Your cubes on table ================= -->
     <!-- table top is z=0.800, cube center z should be 0.800 + 0.025 = 0.825 (matches your values) -->
-    <body name="green_cube" pos="0.45  0.18 0.825">
+    <body name="green_cube" pos="0.45  0.18 0.85">
       <geom type="box" size="0.025 0.025 0.025" material="mat_green" contype="1" conaffinity="1" density="300"/>
     </body>
-    <body name="blue_cube" pos="0.45 -0.18 0.825">
+    <body name="blue_cube" pos="0.45 -0.18 0.85">
       <geom type="box" size="0.025 0.025 0.025" material="mat_blue" contype="1" conaffinity="1" density="300"/>
     </body>
 

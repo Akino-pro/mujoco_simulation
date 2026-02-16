@@ -69,18 +69,18 @@
     <!-- Table -->
     <body name="table" pos="0 0 0.775">
       <!-- Collision top -->
-      <geom name="table_collision" size="0.4 0.4 0.025" type="box" rgba="0.5 0.5 0 1"/>
+      <geom name="table_collision" size="0.8 0.8 0.025" type="box" rgba="0.5 0.5 0 1"/>
       <!-- Visual top -->
-      <geom name="table_visual" size="0.4 0.4 0.025" type="box"
+      <geom name="table_visual" size="0.8 0.8 0.025" type="box"
             contype="0" conaffinity="0" group="1" material="table_ceramic"/>
       <!-- Legs (visual only) -->
-      <geom name="table_leg1_visual" size="0.025 0.3875" pos=" 0.3  0.3 -0.3875" type="cylinder"
+      <geom name="table_leg1_visual" size="0.025 0.3875" pos=" 0.7  0.7 -0.3875" type="cylinder"
             contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
-      <geom name="table_leg2_visual" size="0.025 0.3875" pos="-0.3  0.3 -0.3875" type="cylinder"
+      <geom name="table_leg2_visual" size="0.025 0.3875" pos=" -0.7  0.7 -0.3875" type="cylinder"
             contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
-      <geom name="table_leg3_visual" size="0.025 0.3875" pos="-0.3 -0.3 -0.3875" type="cylinder"
+      <geom name="table_leg3_visual" size="0.025 0.3875" pos=" -0.7  -0.7 -0.3875" type="cylinder"
             contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
-      <geom name="table_leg4_visual" size="0.025 0.3875" pos=" 0.3 -0.3 -0.3875" type="cylinder"
+      <geom name="table_leg4_visual" size="0.025 0.3875" pos=" 0.7  -0.7 -0.3875" type="cylinder"
             contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
 
       <!-- Handy marker: table top center (world z = 0.775 + 0.025 = 0.800) -->
