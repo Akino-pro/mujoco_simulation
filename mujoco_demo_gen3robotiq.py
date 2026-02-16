@@ -33,8 +33,7 @@ except Exception:
 
 
 # ======== UPDATE THIS PATH ON YOUR MACHINE ========
-URDF_PATH = r"D:\mujoco_simulation\gen3_modified.urdf"
-
+URDF_PATH = r"gen3_modified.urdf"
 
 def _extract_tag_inner(text: str, tag: str) -> str:
     m = re.search(rf"<{tag}\b[^>]*>(.*?)</{tag}>", text, flags=re.DOTALL)
