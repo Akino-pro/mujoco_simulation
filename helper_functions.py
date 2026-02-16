@@ -452,11 +452,10 @@ def draw_pip_border(viewer, x: int, y: int, w: int, h: int, thickness: int = 3):
 
     # Fallback: if mjr_rectangle is missing, do nothing (tell me your mujoco.__version__)
     # and I’ll switch to an OpenGL-line overlay approach.
+
+
 def show_wrist_window(img_rgb: np.ndarray, title: str = "Wrist Camera", w: int = 480, h: int = 360):
-    """
-    Shows a small live wrist camera window using OpenCV with a red border.
-    img_rgb: (H,W,3) uint8 RGB
-    """
+    
     if cv2 is None:
         return
 
@@ -468,6 +467,7 @@ def show_wrist_window(img_rgb: np.ndarray, title: str = "Wrist Camera", w: int =
 
     cv2.imshow(title, frame)
     cv2.waitKey(1)
+
 
 def find_any_object_id(model: mujoco.MjModel, names: list[str]):
     """
@@ -920,4 +920,90 @@ def draw_body_frame_in_viewer(viewer, data, body_id: int, length=0.10, radius=0.
     _add_capsule(p, py, [0, 1, 0, 1])  # Y
     _add_capsule(p, pz, [0, 0, 1, 1])  # Z
 
+def show_wrist_window2(frame, title="Wrist Camera", w=480, h=480, *, fallback_save_path=None):
+    """
+    Cross-platform safe OpenCV imshow.
+    - Sanitizes dtype/shape
+    - Ensures contiguous memory
+    - Pumps events via waitKey(1)
+    - NEVER raises: on failure prints warning and optionally saves a PNG
+    Returns: True if displayed, False otherwise
+    """
+    try:
+        import numpy as np
+        import cv2
+    except Exception:
+        return False
+
+    try:
+        # ---- Validate ----
+        if frame is None:
+            print("[WARN] show_wrist_window: frame is None")
+            return False
+        if not hasattr(frame, "shape"):
+            print(f"[WARN] show_wrist_window: frame type={type(frame)} (not ndarray-like)")
+            return False
+        if frame.size == 0:
+            print("[WARN] show_wrist_window: empty frame")
+            return False
+
+        img = frame
+
+        # ---- Convert to uint8 BGR ----
+        if img.dtype != np.uint8:
+            # common: float32 in [0,1] from render()
+            if np.issubdtype(img.dtype, np.floating):
+                mx = float(np.nanmax(img)) if img.size else 0.0
+                if mx <= 1.5:
+                    img = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
+                else:
+                    img = np.clip(img, 0.0, 255.0).astype(np.uint8)
+            else:
+                img = np.clip(img, 0, 255).astype(np.uint8)
+
+        # MuJoCo renderer typically returns RGB; OpenCV expects BGR
+        if img.ndim == 3 and img.shape[2] == 3:
+            img = img[..., ::-1]  # RGB->BGR
+        elif img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        elif img.ndim == 3 and img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        else:
+            print(f"[WARN] show_wrist_window: unexpected shape {img.shape}")
+            return False
+
+        # ---- Resize + contiguous ----
+        if (img.shape[1], img.shape[0]) != (w, h):
+            img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+        img = np.ascontiguousarray(img)
+
+        # ---- Show + pump events ----
+        cv2.imshow(title, img)
+        cv2.waitKey(1)  # important on macOS
+
+        return True
+
+    except cv2.error as e:
+        print(f"[WARN] OpenCV imshow failed ({title}): {e}")
+    except Exception as e:
+        print(f"[WARN] show_wrist_window unexpected error ({title}): {e}")
+
+    # Optional fallback: save image for debugging
+    if fallback_save_path is not None:
+        try:
+            import cv2
+            cv2.imwrite(fallback_save_path, img)
+            print(f"[INFO] Saved wrist image to {fallback_save_path}")
+        except Exception:
+            pass
+
+    return False
+
+def viewer_use_fixed_camera(viewer, cam_id: int):
+    # Render the viewer from a named MJCF camera (your wrist_rgb)
+    viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+    viewer.cam.fixedcamid = int(cam_id)
+
+def viewer_use_free_camera(viewer):
+    viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
 
