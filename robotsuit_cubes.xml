@@ -19,18 +19,24 @@
 
     <!-- Arena textures -->
     <texture type="2d" colorspace="sRGB" name="texplane"
-             file="robosuite/models/assets/textures/light-gray-floor-tile.png"/>
-    <texture type="cube" colorspace="linear" name="tex-ceramic"
-             file="robosuite/models/assets/textures/ceramic.png"/>
+             file="textures/light-gray-floor-tile.png"/>
+    <texture type="2d" colorspace="sRGB" name="tex-wood"
+             file="textures/light_wood.png"/>
     <texture type="cube" colorspace="linear" name="tex-steel-brushed"
-             file="robosuite/models/assets/textures/steel-brushed.png"/>
+             file="textures/steel-brushed.png"/>
     <texture type="2d" colorspace="linear" name="tex-light-gray-plaster"
-             file="robosuite/models/assets/textures/light-gray-plaster.png"/>
+             file="textures/light-gray-plaster.png"/>
 
     <!-- Materials -->
     <material name="floorplane" texture="texplane" texuniform="true" texrepeat="2 2"
               specular="0" shininess="0" reflectance="0.01"/>
-    <material name="table_ceramic" texture="tex-ceramic" specular="0.2" shininess="0"/>
+    <material name="table_wood"
+          texture="tex-wood"
+          texuniform="true"
+          texrepeat="1 1"
+          specular="0.35"
+          shininess="0.4"
+          reflectance="0.15"/>
     <material name="table_legs_metal" texture="tex-steel-brushed" shininess="0.8" reflectance="0.8"/>
     <material name="walls_mat" texture="tex-light-gray-plaster" texuniform="true" texrepeat="3 3"
               specular="0.1" shininess="0.1"/>
@@ -90,43 +96,136 @@
     <camera name="birdview"  pos="-0.2 0 3"  quat="0.707107 0 0 0.707107"/>
     <camera name="agentview" pos="0.5 0 1.35" quat="0.653098 0.271041 0.271041 0.653098"/>
     <camera name="sideview"  pos="-0.0565177 1.27612 1.48796" quat="0.00990507 0.00687796 0.591223 0.806418"/>
-      <camera name="wrist_rgb" mode="fixed" pos="0 0 0" quat="1 0 0 0" fovy="60"/>
+    <camera name="wrist_rgb" mode="fixed" pos="0 0 0" quat="1 0 0 0" fovy="60"/>
+
+    <!-- NEW: Fixed overhead camera (lab measurement)
+         table top = 0.72 m above ground, camera is +0.43 m above table top => z = 1.15
+         x = +0.10 m, y = +0.50 m relative to Kinova base frame (assumed at world origin)
+         Looking straight down (-Z): identity quat works
+    -->
+     <!-- Fixed overhead camera: 1.0668m above 0.72m table -->
+    <camera name="fixed_down"
+            mode="fixed"
+            pos="0.10 0.50 1.7868"
+            quat="1 0 0 0"
+            fovy="60"/>
+
+   <!-- ================= Fixed camera rig marker (Γ-shape) ================= -->
+    <!-- Camera stays at (0.10, 0.50, 1.7868). Stand base is on right table at x=0.15. -->
+    <body name="fixed_cam_rig" pos="0.20 0.50 0.72">
+
+      <!-- Base plate sitting on table -->
+      <geom name="fixed_cam_baseplate" type="cylinder"
+            size="0.06 0.01"
+            pos="0.05 0 0"
+            rgba="0.15 0.15 0.15 1"
+            contype="0" conaffinity="0" group="1"/>
+
+      <!-- Vertical pole: from table top (z=0.72) up to camera height (z=1.7868) -->
+      <!-- height = 1.0668 -->
+      <geom name="fixed_cam_pole" type="capsule"
+            fromto="0.05 0 0   0.05 0 1.0668"
+            size="0.012"
+            rgba="0.2 0.2 0.2 1"
+            contype="0" conaffinity="0" group="1"/>
+
+      <!-- Horizontal arm at the top: 5cm toward robot table (negative X) -->
+      <!-- from (x=0.15) to camera x=0.10 => -0.05 in local X -->
+      <geom name="fixed_cam_arm" type="capsule"
+            fromto="0.05 0 1.0668   -0.05 0 1.0668"
+            size="0.010"
+            rgba="0.2 0.2 0.2 1"
+            contype="0" conaffinity="0" group="1"/>
+
+      <!-- Small camera box at the arm end, aligned with fixed_down camera position -->
+      <geom name="fixed_cam_box" type="box"
+            pos="-0.05 0 1.0668"
+            size="0.04 0.025 0.02"
+            rgba="0.05 0.05 0.05 1"
+            contype="0" conaffinity="0" group="1"/>
+
+      <!-- “Lens” pointing down -->
+      <geom name="fixed_cam_lens" type="cylinder"
+            pos="-0.05 0 1.0368"
+            size="0.01 0.02"
+            rgba="0.12 0.12 0.12 1"
+            contype="0" conaffinity="0" group="1"/>
+
+      <!-- Downward ray from camera location (visual only) -->
+      <geom name="fixed_cam_ray" type="capsule"
+            fromto="-0.05 0 1.0668   -0.05 0 0.00"
+            size="0.003"
+            rgba="1 0 0 1"
+            contype="0" conaffinity="0" group="1"/>
+
+      <site name="fixed_cam_site" pos="-0.05 0 1.0668" size="0.01" rgba="1 0 0 1"/>
+    </body>
 
     <!-- Light -->
     <light pos="1 1 1.5" dir="-0.19245 -0.19245 -0.96225" type="directional" castshadow="false"/>
 
-    <!-- Robosuite Table -->
-    <body name="arena_table" pos="0 0 0.775">
-      <!-- Collision top -->
-      <geom name="table_collision" size="0.8 0.8 0.025" type="box" rgba="0.5 0.5 0 1"/>
-      <!-- Visual top -->
-      <geom name="table_visual" size="0.8 0.8 0.025" type="box"
-            contype="0" conaffinity="0" group="1" material="table_ceramic"/>
-      <!-- Legs (visual only) -->
-      <geom name="table_leg1_visual" size="0.025 0.3875" pos=" 0.7  0.7 -0.3875" type="cylinder"
+    <!-- Robosuite Table (SPLIT INTO TWO TABLES WITH 1cm GAP AT x=0.05) -->
+    <!-- Table height: body z=0.695 => table top z=0.695+0.025=0.72 -->
+        <!-- ================= Two tables aligned with 5cm gap ================= -->
+    <!-- Table top target: z = 0.72  => body z = 0.72 - 0.025 = 0.695 -->
+    <!-- Left table right edge is at x=0.0 (robot base at edge) -->
+    <body name="arena_table_left" pos="-0.35 0.3 0.695">
+      <!-- top (collision) -->
+      <geom name="table_left_collision" size="0.4 0.8 0.025" type="box"
+            rgba="0.5 0.5 0 1" contype="1" conaffinity="1"/>
+      <!-- top (visual) -->
+      <geom name="table_left_visual" size="0.4 0.8 0.025" type="box"
+            contype="0" conaffinity="0" group="1" material="table_wood"/>
+
+      <!-- legs (visual only) -->
+      <geom name="table_left_leg1_visual" size="0.025 0.3875" pos=" 0.3  0.7 -0.3875" type="cylinder"
             contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
-      <geom name="table_leg2_visual" size="0.025 0.3875" pos=" -0.7  0.7 -0.3875" type="cylinder"
+      <geom name="table_left_leg2_visual" size="0.025 0.3875" pos="-0.3  0.7 -0.3875" type="cylinder"
             contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
-      <geom name="table_leg3_visual" size="0.025 0.3875" pos=" -0.7  -0.7 -0.3875" type="cylinder"
+      <geom name="table_left_leg3_visual" size="0.025 0.3875" pos="-0.3 -0.7 -0.3875" type="cylinder"
             contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
-      <geom name="table_leg4_visual" size="0.025 0.3875" pos=" 0.7  -0.7 -0.3875" type="cylinder"
+      <geom name="table_left_leg4_visual" size="0.025 0.3875" pos=" 0.3 -0.7 -0.3875" type="cylinder"
             contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
 
-      <!-- Handy marker: table top center (world z = 0.775 + 0.025 = 0.800) -->
-      <site name="table_top" pos="0 0 0.025" size="0.001" rgba="0 0 0 0"/>
+      <site name="table_top_left" pos="0 0 0.025" size="0.006" rgba="1 0 0 0.8"/>
+    </body>
+
+    <!-- Right table left edge is at x=0.05 (5cm gap from left table) -->
+    <body name="arena_table_right" pos="0.6 0.3 0.695">
+      <!-- top (collision) -->
+      <geom name="table_right_collision" size="0.4 0.8 0.025" type="box"
+            rgba="0.5 0.5 0 1" contype="1" conaffinity="1"/>
+      <!-- top (visual) -->
+      <geom name="table_right_visual" size="0.4 0.8 0.025" type="box"
+            contype="0" conaffinity="0" group="1" material="table_wood"/>
+
+      <!-- legs (visual only) -->
+      <geom name="table_right_leg1_visual" size="0.025 0.3875" pos=" 0.3  0.7 -0.3875" type="cylinder"
+            contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
+      <geom name="table_right_leg2_visual" size="0.025 0.3875" pos="-0.3  0.7 -0.3875" type="cylinder"
+            contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
+      <geom name="table_right_leg3_visual" size="0.025 0.3875" pos="-0.3 -0.7 -0.3875" type="cylinder"
+            contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
+      <geom name="table_right_leg4_visual" size="0.025 0.3875" pos=" 0.3 -0.7 -0.3875" type="cylinder"
+            contype="0" conaffinity="0" group="1" material="table_legs_metal"/>
+
+      <site name="table_top_right" pos="0 0 0.025" size="0.006" rgba="0 0 1 0.8"/>
     </body>
 
     <!-- ================= Your cubes on table ================= -->
-    <!-- table top is z=0.800, cube center z should be 0.800 + 0.025 = 0.825 (matches your values) -->
-    <body name="green_cube" pos="0.45  0.18 0.85">
+    <!-- NOTE: your comment says cube center should be 0.825, but your bodies use 0.85.
+         Leaving your original numbers unchanged to avoid breaking your setup.
+         If you want the cube bottoms exactly on the table, use z=0.825 instead.
+    -->
+    <body name="green_cube" pos="0.45  0.18 0.77">
       <geom type="box" size="0.025 0.025 0.025" material="mat_green" contype="1" conaffinity="1" density="300"/>
     </body>
-    <body name="blue_cube" pos="0.45 -0.18 0.85">
+    <body name="blue_cube" pos="0.45 -0.18 0.77">
       <geom type="box" size="0.025 0.025 0.025" material="mat_blue" contype="1" conaffinity="1" density="300"/>
     </body>
 
     <!-- ================= Your robot mounted on Robosuite table top ================= -->
-    <body name="gen3_mount" pos="0 0 0.8">
+    <body name="gen3_mount" pos="0 0 0.72">
       <geom type="mesh" mesh="base_link"/>
       <body name="gen3_shoulder_link" pos="0 0 0.15643" quat="-3.67321e-06 1 0 0">
         <inertial pos="-2.3e-05 -0.010364 -0.07336" quat="0.707051 0.0451246 -0.0453544 0.704263" mass="1.3773" diaginertia="0.00488868 0.00457 0.00135132"/>
