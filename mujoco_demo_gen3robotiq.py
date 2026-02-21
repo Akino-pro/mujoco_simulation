@@ -289,7 +289,8 @@ def main():
 
                                 renderer.update_scene(data, camera="wrist_rgb")
                                 wrist_rgb = renderer.render()
-                                show_wrist_window(wrist_rgb, title="Wrist Camera", w=480, h=480)
+                                wrist_bgr = wrist_rgb[..., ::-1]
+                                show_wrist_window(wrist_bgr , title="Wrist Camera", w=480, h=480)
 
                                 # ===== Fixed overhead camera window (MJCF camera fixed_down) =====
                                 renderer.update_scene(data, camera="fixed_down")
@@ -364,7 +365,8 @@ def main():
 
                                 renderer.update_scene(data, camera="wrist_rgb")
                                 wrist_rgb = renderer.render()
-                                show_wrist_window(wrist_rgb, title="Wrist Camera", w=480, h=480)
+                                wrist_bgr = wrist_rgb[..., ::-1]
+                                show_wrist_window(wrist_bgr , title="Wrist Camera", w=480, h=480)
 
                                 # ===== Fixed overhead camera window =====
                                 renderer.update_scene(data, camera="fixed_down")

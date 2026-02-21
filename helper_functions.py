@@ -462,9 +462,6 @@ def show_wrist_window(img_rgb: np.ndarray, title: str = "Wrist Camera", w: int =
     # resize
     frame = cv2.resize(img_rgb, (w, h), interpolation=cv2.INTER_AREA)
 
-    # red border
-    cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 0, 255), 3)  # BGR red
-
     cv2.imshow(title, frame)
     cv2.waitKey(1)
 
