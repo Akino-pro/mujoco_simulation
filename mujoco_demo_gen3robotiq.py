@@ -7,7 +7,7 @@ Gen3 + Robotiq-85 in MuJoCo: control by EEF pose sequence + 3-phase gripper (exp
 Notes:
 - The MuJoCo viewer window remains interactive (you can move around).
 - The wrist camera view is rendered via MuJoCo Renderer + OpenCV window (as before).
-- The new fixed camera view is rendered from an MJCF camera named "fixed_down"
+- The fixed camera view is rendered from an MJCF camera named "fixed_down"
   (must exist in robotsuit_cubes.xml).
 
 Install:
@@ -84,7 +84,7 @@ def main():
     urdf_dir = os.path.dirname(urdf_abs)
     os.chdir(urdf_dir)
 
-    # Scene MJCF you showed (must contain cameras: "wrist_rgb" and "fixed_down")
+    # Scene MJCF (must contain cameras: "wrist_rgb" and "fixed_down")
     scene_path = os.path.join(urdf_dir, "robotsuit_cubes.xml")
 
     # 1) Load the scene
@@ -150,8 +150,7 @@ def main():
     if cv2 is None:
         print("[WARN] opencv-python not installed; camera windows disabled.")
     else:
-        # You can choose a larger resolution if you like
-        renderer = mujoco.Renderer(model, width=480, height=480)
+        renderer = mujoco.Renderer(model, width=1920, height=1080)
 
     # -------------------------
     # IK timing
@@ -163,15 +162,33 @@ def main():
     dt_inner = dt / IK_ITERS
 
     # -------------------------
-    # Pick & place curve (green -> blue)
-    # (NOTE: you updated table height to 0.72 in XML; cubes now at z=0.745)
+    # NEW Pick & place curve: small_bear -> big_bear (from your MJCF bodies)
     # -------------------------
-    p_green = np.array([0.45, 0.18, 0.745], dtype=float)
-    p_blue = np.array([0.45, -0.18, 0.745], dtype=float)
+    small_bear_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "small_bear")
+    big_bear_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "big_bear")
+    if small_bear_id < 0 or big_bear_id < 0:
+        raise RuntimeError("Could not find bodies 'small_bear' and/or 'big_bear' in the XML.")
 
-    z_above = 0.95
-    z_pick = 0.80
+    small_bear_id = int(small_bear_id)
+    big_bear_id = int(big_bear_id)
 
+    # Use current world positions (works even if bears are freejoint and move)
+    p_small = data.xpos[small_bear_id].copy()
+    p_big = data.xpos[big_bear_id].copy()
+
+    # Optional: offset so you aim slightly in front of the bear center (tune if needed)
+    # (x,y,z) in world frame
+    pick_xy_offset = np.array([0.00, 0.00, 0.0], dtype=float)
+    place_xy_offset = np.array([0.00, 0.00, 0.0], dtype=float)
+    p_small = p_small + pick_xy_offset
+    p_big = p_big + place_xy_offset
+
+    # Heights: your table top is z=0.72 and bears are around z=0.71
+    # So z_pick should be near table surface (not 0.80 like cubes).
+    z_above = 0.92
+    z_pick = 0.76
+
+    # Force EE to point down (same behavior as before)
     R0 = data.xmat[ee_body_id].reshape(3, 3).copy()
     R_des, k_up = make_R_with_axis_k_down(R0)
     q_hold = quat_from_mat3(R_des)
@@ -181,18 +198,25 @@ def main():
         s = float(s)
         return ((1 - s) ** 3) * p0 + 3 * ((1 - s) ** 2) * s * p1 + 3 * (1 - s) * (s ** 2) * p2 + (s ** 3) * p3
 
-    pA0 = np.array([p_green[0], p_green[1], z_above], dtype=float)
-    pA1 = np.array([p_green[0], p_green[1], z_pick], dtype=float)
-    pA2 = np.array([p_green[0], p_green[1], z_above], dtype=float)
+    # Approach/retreat points for small bear (A) and big bear (B)
+    pA0 = np.array([p_small[0], p_small[1], z_above], dtype=float)
+    pA1 = np.array([p_small[0], p_small[1], z_pick], dtype=float)
+    pA2 = np.array([p_small[0], p_small[1], z_above], dtype=float)
 
-    pB0 = np.array([p_blue[0], p_blue[1], z_above], dtype=float)
-    pB1 = np.array([p_blue[0], p_blue[1], z_pick], dtype=float)
-    pB2 = np.array([p_blue[0], p_blue[1], z_above], dtype=float)
+    pB0 = np.array([p_big[0], p_big[1], z_above], dtype=float)
+    pB1 = np.array([p_big[0], p_big[1], z_pick], dtype=float)
+    pB2 = np.array([p_big[0], p_big[1], z_above], dtype=float)
 
+    # Bezier arc between bears
     mid_z = 1.05
-    c1 = np.array([p_green[0], 0.00, mid_z], dtype=float)
-    c2 = np.array([p_blue[0], 0.00, mid_z], dtype=float)
+    mid_y = 0.5 * (p_small[1] + p_big[1])
+    c1 = np.array([p_small[0], mid_y, mid_z], dtype=float)
+    c2 = np.array([p_big[0], mid_y, mid_z], dtype=float)
 
+    # Same segment pattern as before:
+    # - go above A -> down -> close -> up
+    # - move to B -> down -> open -> up
+    # - move back to A
     segments = [
         ("lin", pA0, pA0, 1.0, 0),
         ("lin", pA0, pA1, 1.2, 0),
@@ -205,6 +229,7 @@ def main():
         ("bez", pB2, c2, c1, pA0, 2.4, 0),
     ]
 
+    # Gripper state (keep your original behavior)
     g = 0.8
     GRIP_SPEED = 0.9
 
@@ -224,6 +249,23 @@ def main():
 
         try:
             while viewer.is_running():
+                # (Optional) refresh bear positions each outer loop, in case bears drift due to physics
+                # Comment this out if you want fixed targets.
+                mujoco.mj_forward(model, data)
+                p_small = data.xpos[small_bear_id].copy() + pick_xy_offset
+                p_big = data.xpos[big_bear_id].copy() + place_xy_offset
+
+                # Update targets (keep same heights)
+                pA0[:] = [p_small[0], p_small[1], z_above]
+                pA1[:] = [p_small[0], p_small[1], z_pick]
+                pA2[:] = [p_small[0], p_small[1], z_above]
+                pB0[:] = [p_big[0], p_big[1], z_above]
+                pB1[:] = [p_big[0], p_big[1], z_pick]
+                pB2[:] = [p_big[0], p_big[1], z_above]
+                mid_y = 0.5 * (p_small[1] + p_big[1])
+                c1[:] = [p_small[0], mid_y, mid_z]
+                c2[:] = [p_big[0], mid_y, mid_z]
+
                 for seg in segments:
                     kind = seg[0]
 
@@ -290,13 +332,13 @@ def main():
                                 renderer.update_scene(data, camera="wrist_rgb")
                                 wrist_rgb = renderer.render()
                                 wrist_bgr = wrist_rgb[..., ::-1]
-                                show_wrist_window(wrist_bgr , title="Wrist Camera", w=480, h=480)
+                                show_wrist_window(wrist_bgr, title="Wrist Camera", w=960, h=540)
 
-                                # ===== Fixed overhead camera window (MJCF camera fixed_down) =====
+                                # ===== Fixed overhead camera window =====
                                 renderer.update_scene(data, camera="fixed_down")
                                 fixed_rgb = renderer.render()
                                 fixed_bgr = fixed_rgb[..., ::-1]
-                                show_wrist_window(fixed_bgr, title="Fixed Camera (Downward)", w=480, h=480)
+                                show_wrist_window(fixed_bgr, title="Fixed Camera (Downward)", w=960, h=540)
 
                             next_step_time += dt
                             sleep_s = next_step_time - time.perf_counter()
@@ -366,13 +408,13 @@ def main():
                                 renderer.update_scene(data, camera="wrist_rgb")
                                 wrist_rgb = renderer.render()
                                 wrist_bgr = wrist_rgb[..., ::-1]
-                                show_wrist_window(wrist_bgr , title="Wrist Camera", w=480, h=480)
+                                show_wrist_window(wrist_bgr, title="Wrist Camera", w=960, h=540)
 
                                 # ===== Fixed overhead camera window =====
                                 renderer.update_scene(data, camera="fixed_down")
                                 fixed_rgb = renderer.render()
                                 fixed_bgr = fixed_rgb[..., ::-1]
-                                show_wrist_window(fixed_bgr, title="Fixed Camera (Downward)", w=480, h=480)
+                                show_wrist_window(fixed_bgr, title="Fixed Camera (Downward)", w=960, h=540)
 
                             next_step_time += dt
                             sleep_s = next_step_time - time.perf_counter()
