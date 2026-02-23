@@ -1,31 +1,13 @@
-"""
-Gen3 + Robotiq-85 in MuJoCo: control by EEF pose sequence + 3-phase gripper (explicit mimic)
-+ DLS IK with SAFE joint-speed limiting (10 deg/s)
-+ Wrist camera window
-+ Fixed overhead camera window (looking straight down)
-
-Notes:
-- The MuJoCo viewer window remains interactive (you can move around).
-- The wrist camera view is rendered via MuJoCo Renderer + OpenCV window (as before).
-- The fixed camera view is rendered from an MJCF camera named "fixed_down"
-  (must exist in robotsuit_cubes.xml).
-
-Install:
-  pip install mujoco numpy opencv-python
-"""
 import os
 import time
-import re
-from pathlib import Path
-
 import numpy as np
 import mujoco
 import mujoco.viewer
 
 from helper_functions import (
     _get_joint_ids_by_name, find_ee_target, build_gripper_controls, quat_from_mat3,
-    set_white_environment_visuals, ik_step_dls, apply_gripper, show_wrist_window,
-    make_R_with_axis_k_down, make_free_camera_from_frame_pose, draw_body_frame_in_viewer
+    set_white_environment_visuals, apply_gripper, show_wrist_window,
+    make_R_with_axis_k_down
 )
 
 try:
@@ -33,104 +15,122 @@ try:
 except Exception:
     cv2 = None
 
-
-# ======== UPDATE THIS PATH ON YOUR MACHINE (ONLY USED FOR WORKDIR) ========
 URDF_PATH = r"gen3_modified.urdf"
 
 
-def _extract_tag_inner(text: str, tag: str) -> str:
-    m = re.search(rf"<{tag}\b[^>]*>(.*?)</{tag}>", text, flags=re.DOTALL)
-    if m:
-        return m.group(1)
-    m2 = re.search(rf"<{tag}\b[^>]*/>", text, flags=re.DOTALL)
-    if m2:
-        return ""
-    return ""
+def _normalize(v: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(v)
+    if n < 1e-12:
+        return v
+    return v / n
 
 
-def _strip_comments(s: str) -> str:
-    return re.sub(r"<!--.*?-->", "", s or "", flags=re.DOTALL)
+def mat3_to_quat(R: np.ndarray) -> np.ndarray:
+    q = np.zeros(4, dtype=float)
+    mujoco.mju_mat2Quat(q, R.reshape(-1))
+    return q
 
 
-def _ensure_nonempty_asset_children(asset_inner: str) -> str:
-    keepalive = '<material name="__asset_keepalive" rgba="1 1 1 1"/>\n'
-    s = (asset_inner or "").strip()
-    if not s:
-        return keepalive
-    if not _strip_comments(s).strip():
-        return keepalive
-    return s + "\n"
+def quat_conj(q: np.ndarray) -> np.ndarray:
+    return np.array([q[0], -q[1], -q[2], -q[3]], dtype=float)
 
 
-def _ensure_nonempty_body_children(worldbody_inner: str) -> str:
-    keepalive = '<geom name="__body_keepalive" type="sphere" size="0.0001" rgba="0 0 0 0"/>\n'
-    s = (worldbody_inner or "").strip()
-    if not s:
-        return keepalive
-    if not _strip_comments(s).strip():
-        return keepalive
-    return s + "\n"
+def quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    out = np.zeros(4, dtype=float)
+    mujoco.mju_mulQuat(out, a, b)
+    return out
 
 
-def _indent(s: str, n_spaces: int) -> str:
-    pad = " " * n_spaces
-    lines = (s or "").splitlines()
-    return "\n".join(pad + ln if ln.strip() else ln for ln in lines)
+def quat_to_rotvec(q_err: np.ndarray) -> np.ndarray:
+    v = np.zeros(3, dtype=float)
+    mujoco.mju_quat2Vel(v, q_err, 1.0)
+    return v
+
+
+def dls_ik_compute_qtarget(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    ee_body_id: int,
+    arm_joint_ids: list[int],
+    qpos_adrs: list[int],
+    dof_adrs: list[int],
+    p_des: np.ndarray,
+    q_des: np.ndarray,
+    rot_w: float,
+    damping: float,
+    dt_step: float,
+    qd_max: np.ndarray,
+    iters: int,
+) -> np.ndarray:
+    q_arm0 = np.array([data.qpos[a] for a in qpos_adrs], dtype=float)
+
+    for _ in range(iters):
+        mujoco.mj_forward(model, data)
+
+        p_cur = data.xpos[ee_body_id].copy()
+        R_cur = data.xmat[ee_body_id].reshape(3, 3).copy()
+        q_cur = mat3_to_quat(R_cur)
+
+        ep = (p_des - p_cur)
+        q_err = quat_mul(q_des, quat_conj(q_cur))
+        er = quat_to_rotvec(q_err)
+        e = np.concatenate([ep, rot_w * er], axis=0)
+
+        Jp = np.zeros((3, model.nv), dtype=float)
+        Jr = np.zeros((3, model.nv), dtype=float)
+        mujoco.mj_jacBody(model, data, Jp, Jr, ee_body_id)
+
+        Jp7 = Jp[:, dof_adrs]
+        Jr7 = Jr[:, dof_adrs]
+        J6 = np.vstack([Jp7, rot_w * Jr7])
+
+        JJt = J6 @ J6.T + (damping ** 2) * np.eye(6)
+        try:
+            x = np.linalg.solve(JJt, e)
+        except np.linalg.LinAlgError:
+            break
+        dq = J6.T @ x
+
+        dq_lim = qd_max * dt_step
+        dq = np.clip(dq, -dq_lim, dq_lim)
+
+        for i, adr in enumerate(qpos_adrs):
+            data.qpos[adr] += dq[i]
+
+        if np.linalg.norm(ep) < 1e-4 and np.linalg.norm(er) < 2e-4:
+            break
+
+    q_target = np.array([data.qpos[a] for a in qpos_adrs], dtype=float)
+
+    for i, adr in enumerate(qpos_adrs):
+        data.qpos[adr] = q_arm0[i]
+    mujoco.mj_forward(model, data)
+
+    return q_target
 
 
 def main():
-    # Keep your original behavior: cd into URDF directory so STL relative paths resolve.
     urdf_abs = os.path.abspath(URDF_PATH)
     urdf_dir = os.path.dirname(urdf_abs)
     os.chdir(urdf_dir)
 
-    # Scene MJCF (must contain cameras: "wrist_rgb" and "fixed_down")
     scene_path = os.path.join(urdf_dir, "robotsuit_cubes.xml")
-
-    # 1) Load the scene
     model = mujoco.MjModel.from_xml_path(scene_path)
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
 
-    # 2) Camera IDs
-    wrist_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_rgb")
-    if wrist_cam_id < 0:
-        raise RuntimeError("Camera 'wrist_rgb' not found in model (did you add it to the XML?)")
-    wrist_cam_id = int(wrist_cam_id)
+    wrist_cam_id = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_rgb"))
+    fixed_cam_id = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "fixed_down"))
+    if wrist_cam_id < 0 or fixed_cam_id < 0:
+        raise RuntimeError("Missing wrist_rgb or fixed_down camera in XML.")
 
-    fixed_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "fixed_down")
-    if fixed_cam_id < 0:
-        raise RuntimeError("Camera 'fixed_down' not found in model (add it in <worldbody> of robotsuit_cubes.xml).")
-    fixed_cam_id = int(fixed_cam_id)
-
-    # -------------------------
-    # Wrist camera body (if present)
-    # -------------------------
-    CAM_NAMES = [
-        "wrist_mounted_camera_color_optical_frame",
-        "wrist_mounted_camera_depth_optical_frame",
-        "wrist_camera_link",
-    ]
-    cam_body_id = -1
-    cam_body_name = None
-    for nm in CAM_NAMES:
-        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, nm)
-        if bid >= 0:
-            cam_body_id = int(bid)
-            cam_body_name = nm
-            break
-    if cam_body_id >= 0:
-        print(f"[INFO] Using wrist camera frame body: {cam_body_name}")
-    else:
-        print("[WARN] Wrist camera frame body not found. Falling back to bracelet+offset.")
-
-    # -------------------------
-    # Arm joints + EEF body
-    # -------------------------
     arm_joint_names = [f"gen3_joint_{i}" for i in range(1, 8)]
     arm_joint_ids = _get_joint_ids_by_name(model, arm_joint_names)
     qpos_adrs = [int(model.jnt_qposadr[j]) for j in arm_joint_ids]
     dof_adrs = [int(model.jnt_dofadr[j]) for j in arm_joint_ids]
+
+    # hold immediately
+    data.ctrl[:7] = np.array([data.qpos[a] for a in qpos_adrs], dtype=float)
 
     ee_body_id, ee_name = find_ee_target(model)
     print(f"[INFO] Using end-effector body '{ee_name}' (id={ee_body_id})")
@@ -139,105 +139,116 @@ def main():
 
     bracelet_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "gen3_bracelet_link")
     if bracelet_body_id < 0:
-        raise RuntimeError("Could not find body 'gen3_bracelet_link' (needed for wrist camera fallback).")
+        raise RuntimeError("Could not find body 'gen3_bracelet_link'.")
     bracelet_body_id = int(bracelet_body_id)
 
-    # Wrist camera extrinsics (fallback)
     cam_off = np.array([0.0, -0.06841, -0.05044], dtype=float)
 
-    # Renderer
     renderer = None
-    if cv2 is None:
-        print("[WARN] opencv-python not installed; camera windows disabled.")
-    else:
-        renderer = mujoco.Renderer(model, width=1920, height=1080)
+    if cv2 is not None:
+        # smaller = less chance of falling behind
+        renderer = mujoco.Renderer(model, width=960, height=540)
 
-    # -------------------------
-    # IK timing
-    # -------------------------
-    dt = 1.0 / 60.0
-    IK_ITERS = 10
-    qd_safe = np.deg2rad(10.0)
+    dt_view = 1.0 / 60.0
+
+    IK_ITERS_NEAR = 12
+    IK_ITERS_TRANSFER = 6
+
+    qd_safe = np.deg2rad(30.0)
     qd_max = np.full(7, qd_safe, dtype=float)
-    dt_inner = dt / IK_ITERS
 
-    # -------------------------
-    # NEW Pick & place curve: small_bear -> big_bear (from your MJCF bodies)
-    # -------------------------
-    small_bear_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "small_bear")
-    big_bear_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "big_bear")
-    if small_bear_id < 0 or big_bear_id < 0:
-        raise RuntimeError("Could not find bodies 'small_bear' and/or 'big_bear' in the XML.")
+    n_sub_full = max(1, int(round(dt_view / model.opt.timestep)))
+    n_sub_transfer = max(1, int(0.5 * n_sub_full))
 
-    small_bear_id = int(small_bear_id)
-    big_bear_id = int(big_bear_id)
+    big_bear_id = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "big_bear"))
+    box_id = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cardboard_box"))
+    if big_bear_id < 0 or box_id < 0:
+        raise RuntimeError("Missing big_bear or cardboard_box body.")
 
-    # Use current world positions (works even if bears are freejoint and move)
-    p_small = data.xpos[small_bear_id].copy()
-    p_big = data.xpos[big_bear_id].copy()
+    def _set_geom_friction(name: str, slide=3.0, spin=0.03, roll=0.002):
+        gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
+        if gid >= 0:
+            model.geom_friction[int(gid), :] = np.array([slide, spin, roll], dtype=float)
 
-    # Optional: offset so you aim slightly in front of the bear center (tune if needed)
-    # (x,y,z) in world frame
-    pick_xy_offset = np.array([0.00, 0.00, 0.0], dtype=float)
-    place_xy_offset = np.array([0.00, 0.00, 0.0], dtype=float)
-    p_small = p_small + pick_xy_offset
-    p_big = p_big + place_xy_offset
+    _set_geom_friction("big_bear_col", slide=4.0, spin=0.04, roll=0.003)
+    _set_geom_friction("left_fingertip_col", slide=4.0, spin=0.04, roll=0.003)
+    _set_geom_friction("right_fingertip_col", slide=4.0, spin=0.04, roll=0.003)
 
-    # Heights: your table top is z=0.72 and bears are around z=0.71
-    # So z_pick should be near table surface (not 0.80 like cubes).
-    z_above = 0.92
-    z_pick = 0.76
-
-    # Force EE to point down (same behavior as before)
     R0 = data.xmat[ee_body_id].reshape(3, 3).copy()
     R_des, k_up = make_R_with_axis_k_down(R0)
     q_hold = quat_from_mat3(R_des)
-    print(f"[INFO] EE axis pointing up at start was body axis index {k_up} (0=x,1=y,2=z). Forcing it to point down.")
+    print(f"[INFO] Forcing EE axis to point down (k_up={k_up}).")
 
     def bezier(p0, p1, p2, p3, s):
         s = float(s)
         return ((1 - s) ** 3) * p0 + 3 * ((1 - s) ** 2) * s * p1 + 3 * (1 - s) * (s ** 2) * p2 + (s ** 3) * p3
 
-    # Approach/retreat points for small bear (A) and big bear (B)
-    pA0 = np.array([p_small[0], p_small[1], z_above], dtype=float)
-    pA1 = np.array([p_small[0], p_small[1], z_pick], dtype=float)
-    pA2 = np.array([p_small[0], p_small[1], z_above], dtype=float)
+    g = 1.0
+    GRIP_SPEED = 1.2
 
-    pB0 = np.array([p_big[0], p_big[1], z_above], dtype=float)
-    pB1 = np.array([p_big[0], p_big[1], z_pick], dtype=float)
-    pB2 = np.array([p_big[0], p_big[1], z_above], dtype=float)
+    z_above = 0.95
+    z_pick = 0.76
+    z_lift = 1.05
+    z_drop_above_box = 0.95
+    z_drop_into_box = 0.80
 
-    # Bezier arc between bears
-    mid_z = 1.05
-    mid_y = 0.5 * (p_small[1] + p_big[1])
-    c1 = np.array([p_small[0], mid_y, mid_z], dtype=float)
-    c2 = np.array([p_big[0], mid_y, mid_z], dtype=float)
+    # render throttle
+    render_every_lin = 1
+    render_every_bez = 1
 
-    # Same segment pattern as before:
-    # - go above A -> down -> close -> up
-    # - move to B -> down -> open -> up
-    # - move back to A
-    segments = [
-        ("lin", pA0, pA0, 1.0, 0),
-        ("lin", pA0, pA1, 1.2, 0),
-        ("lin", pA1, pA1, 0.8, -1),
-        ("lin", pA1, pA2, 1.2, 0),
-        ("bez", pA2, c1, c2, pB0, 2.4, 0),
-        ("lin", pB0, pB1, 1.2, 0),
-        ("lin", pB1, pB1, 0.8, +1),
-        ("lin", pB1, pB2, 1.0, 0),
-        ("bez", pB2, c2, c1, pA0, 2.4, 0),
-    ]
+    # If you want wrist during transfer, set this True (costs more)
+    wrist_during_transfer = True
 
-    # Gripper state (keep your original behavior)
-    g = 0.8
-    GRIP_SPEED = 0.9
+    next_step_time = time.perf_counter()
 
-    def _normalize(v: np.ndarray) -> np.ndarray:
-        n = np.linalg.norm(v)
-        if n < 1e-9:
-            return v
-        return v / n
+    def render_windows(do_wrist: bool, do_fixed: bool):
+        if renderer is None:
+            return
+
+        if do_wrist:
+            p_b = data.xpos[bracelet_body_id].copy()
+            R_b = data.xmat[bracelet_body_id].reshape(3, 3).copy()
+            p_frame = p_b + R_b @ cam_off
+
+            R_frame = data.xmat[ee_body_id].reshape(3, 3).copy()
+            tool_forward = np.array([0.0, 0.0, -1.0], dtype=float)
+            tool_up = np.array([0.0, -1.0, 0.0], dtype=float)
+
+            eye_out = 0.01
+            p_frame = p_frame + (R_frame @ (tool_forward * eye_out))
+
+            f_world = _normalize(R_frame @ tool_forward)
+            u_world = _normalize(R_frame @ tool_up)
+
+            z_cam_world = _normalize(-f_world)
+            y_cam_world = _normalize(u_world - np.dot(u_world, z_cam_world) * z_cam_world)
+            x_cam_world = _normalize(np.cross(y_cam_world, z_cam_world))
+            y_cam_world = _normalize(np.cross(z_cam_world, x_cam_world))
+
+            R_wc = np.column_stack([x_cam_world, y_cam_world, z_cam_world])
+
+            model.cam_pos[wrist_cam_id] = p_frame
+            model.cam_quat[wrist_cam_id] = quat_from_mat3(R_wc)
+
+            renderer.update_scene(data, camera="wrist_rgb")
+            wrist_rgb = renderer.render()
+            show_wrist_window(wrist_rgb[..., ::-1], title="Wrist Camera", w=960, h=540)
+
+        if do_fixed:
+            renderer.update_scene(data, camera="fixed_down")
+            fixed_rgb = renderer.render()
+            show_wrist_window(fixed_rgb[..., ::-1], title="Fixed Camera (Downward)", w=960, h=540)
+
+    def step_realtime():
+        nonlocal next_step_time
+        next_step_time += dt_view
+        now = time.perf_counter()
+        # snap if too far behind (prevents runaway lag)
+        if now - next_step_time > 0.2:
+            next_step_time = now
+        sleep_s = next_step_time - now
+        if sleep_s > 0:
+            time.sleep(sleep_s)
 
     with mujoco.viewer.launch_passive(model, data) as viewer:
         viewer.cam.distance *= 1.8
@@ -245,35 +256,57 @@ def main():
         viewer.cam.azimuth = 135
         set_white_environment_visuals(model, viewer)
 
-        next_step_time = time.perf_counter()
-
         try:
             while viewer.is_running():
-                # (Optional) refresh bear positions each outer loop, in case bears drift due to physics
-                # Comment this out if you want fixed targets.
                 mujoco.mj_forward(model, data)
-                p_small = data.xpos[small_bear_id].copy() + pick_xy_offset
-                p_big = data.xpos[big_bear_id].copy() + place_xy_offset
 
-                # Update targets (keep same heights)
-                pA0[:] = [p_small[0], p_small[1], z_above]
-                pA1[:] = [p_small[0], p_small[1], z_pick]
-                pA2[:] = [p_small[0], p_small[1], z_above]
-                pB0[:] = [p_big[0], p_big[1], z_above]
-                pB1[:] = [p_big[0], p_big[1], z_pick]
-                pB2[:] = [p_big[0], p_big[1], z_above]
-                mid_y = 0.5 * (p_small[1] + p_big[1])
-                c1[:] = [p_small[0], mid_y, mid_z]
-                c2[:] = [p_big[0], mid_y, mid_z]
+                p_big = data.xpos[big_bear_id].copy()
+                p_box = data.xpos[box_id].copy()
+
+                pB0 = np.array([p_big[0], p_big[1], z_above], dtype=float)
+                pB1 = np.array([p_big[0], p_big[1], z_pick], dtype=float)
+                pB2 = np.array([p_big[0], p_big[1], z_lift], dtype=float)
+
+                pC0 = np.array([p_box[0], p_box[1], z_drop_above_box], dtype=float)
+                pC1 = np.array([p_box[0], p_box[1], z_drop_into_box], dtype=float)
+
+                mid_z = 1.10
+                mid_y = 0.5 * (p_big[1] + p_box[1])
+                c1 = np.array([p_big[0], mid_y, mid_z], dtype=float)
+                c2 = np.array([p_box[0], mid_y, mid_z], dtype=float)
+
+                segments = [
+                    ("lin", pB0, pB0, 0.4, 0, True),
+                    ("lin", pB0, pB1, 1.0, 0, True),
+
+                    ("lin", pB1, pB1, 1.0, -1, True),  # close
+                    ("lin", pB1, pB1, 0.5, 0, True),   # settle
+
+                    ("lin", pB1, pB2, 1.2, 0, True),   # lift
+
+                    ("bez", pB2, c1, c2, pC0, 1.8, 0, False),  # transfer
+
+                    ("lin", pC0, pC1, 1.0, 0, True),   # descend into box
+
+                    ("lin", pC1, pC1, 0.8, +1, True),  # open
+                    ("lin", pC1, pC1, 0.4, 0, True),   # settle
+
+                    ("lin", pC1, pC0, 1.0, 0, False),  # retreat
+                ]
 
                 for seg in segments:
+                    if not viewer.is_running():
+                        break
+
                     kind = seg[0]
 
                     if kind == "lin":
-                        _, p0, p1, T, cmd = seg
-                        T = float(T)
-                        n = max(2, int(np.ceil(T / dt)))
+                        _, p0, p1, T, cmd, near_contact = seg
+                        iters = IK_ITERS_NEAR if near_contact else IK_ITERS_TRANSFER
+                        n_sub = n_sub_full if near_contact else n_sub_transfer
+                        render_every = render_every_lin if near_contact else render_every_bez
 
+                        n = max(2, int(np.ceil(float(T) / dt_view)))
                         for i in range(n):
                             if not viewer.is_running():
                                 break
@@ -282,74 +315,43 @@ def main():
                             p_des = (1.0 - s) * p0 + s * p1
                             q_des = q_hold
 
-                            g += float(cmd) * GRIP_SPEED * dt
+                            g += float(cmd) * GRIP_SPEED * dt_view
                             g = float(np.clip(g, 0.0, 1.0))
                             apply_gripper(model, data, grip_controls, lo_m, hi_m, g)
 
-                            for _ in range(IK_ITERS):
-                                err = ik_step_dls(
-                                    model, data, ee_body_id,
-                                    arm_joint_ids, qpos_adrs, dof_adrs,
-                                    p_des, q_des,
-                                    rot_w=2.0,
-                                    damping=3e-2,
-                                    dt_step=dt_inner,
-                                    qd_max=qd_max,
-                                )
-                                if err < 1e-4:
-                                    break
+                            q_target = dls_ik_compute_qtarget(
+                                model, data, ee_body_id,
+                                arm_joint_ids, qpos_adrs, dof_adrs,
+                                p_des, q_des,
+                                rot_w=2.0,
+                                damping=3e-2,
+                                dt_step=dt_view,
+                                qd_max=qd_max,
+                                iters=iters,
+                            )
+                            data.ctrl[:7] = q_target
+
+                            for _ in range(n_sub):
+                                mujoco.mj_step(model, data)
 
                             viewer.sync()
 
-                            if renderer is not None:
-                                # ===== Wrist camera (same behavior as before) =====
-                                p_b = data.xpos[bracelet_body_id].copy()
-                                R_b = data.xmat[bracelet_body_id].reshape(3, 3).copy()
-                                p_frame = p_b + R_b @ cam_off
+                            # IMPORTANT: pump GUI events EVERY step (prevents Windows freeze)
+                            if cv2 is not None:
+                                cv2.waitKey(1)
 
-                                R_frame = data.xmat[ee_body_id].reshape(3, 3).copy()
+                            if (renderer is not None) and ((i % render_every) == 0):
+                                render_windows(do_wrist=near_contact, do_fixed=True)
 
-                                eye_out = 0.01
-                                eye_up = 0.0
-                                tool_forward = np.array([0.0, 0.0, -1.0], dtype=float)
-                                tool_up = np.array([0.0, -1.0, 0.0], dtype=float)
+                            step_realtime()
 
-                                p_frame = p_frame + (R_frame @ (tool_forward * eye_out)) + (R_frame @ (tool_up * eye_up))
+                    else:
+                        _, p0, p1, p2, p3, T, cmd, _near = seg
+                        iters = IK_ITERS_TRANSFER
+                        n_sub = n_sub_transfer
+                        render_every = render_every_bez
 
-                                f_world = _normalize(R_frame @ tool_forward)
-                                u_world = _normalize(R_frame @ tool_up)
-
-                                z_cam_world = _normalize(-f_world)
-                                y_cam_world = _normalize(u_world - np.dot(u_world, z_cam_world) * z_cam_world)
-                                x_cam_world = _normalize(np.cross(y_cam_world, z_cam_world))
-                                y_cam_world = _normalize(np.cross(z_cam_world, x_cam_world))
-
-                                R_wc = np.column_stack([x_cam_world, y_cam_world, z_cam_world])
-
-                                model.cam_pos[wrist_cam_id] = p_frame
-                                model.cam_quat[wrist_cam_id] = quat_from_mat3(R_wc)
-
-                                renderer.update_scene(data, camera="wrist_rgb")
-                                wrist_rgb = renderer.render()
-                                wrist_bgr = wrist_rgb[..., ::-1]
-                                show_wrist_window(wrist_bgr, title="Wrist Camera", w=960, h=540)
-
-                                # ===== Fixed overhead camera window =====
-                                renderer.update_scene(data, camera="fixed_down")
-                                fixed_rgb = renderer.render()
-                                fixed_bgr = fixed_rgb[..., ::-1]
-                                show_wrist_window(fixed_bgr, title="Fixed Camera (Downward)", w=960, h=540)
-
-                            next_step_time += dt
-                            sleep_s = next_step_time - time.perf_counter()
-                            if sleep_s > 0:
-                                time.sleep(sleep_s)
-
-                    elif kind == "bez":
-                        _, p0, p1, p2, p3, T, cmd = seg
-                        T = float(T)
-                        n = max(2, int(np.ceil(T / dt)))
-
+                        n = max(2, int(np.ceil(float(T) / dt_view)))
                         for i in range(n):
                             if not viewer.is_running():
                                 break
@@ -358,68 +360,36 @@ def main():
                             p_des = bezier(p0, p1, p2, p3, s)
                             q_des = q_hold
 
-                            g += float(cmd) * GRIP_SPEED * dt
+                            g += float(cmd) * GRIP_SPEED * dt_view
                             g = float(np.clip(g, 0.0, 1.0))
                             apply_gripper(model, data, grip_controls, lo_m, hi_m, g)
 
-                            for _ in range(IK_ITERS):
-                                err = ik_step_dls(
-                                    model, data, ee_body_id,
-                                    arm_joint_ids, qpos_adrs, dof_adrs,
-                                    p_des, q_des,
-                                    rot_w=2.0,
-                                    damping=3e-2,
-                                    dt_step=dt_inner,
-                                    qd_max=qd_max,
-                                )
-                                if err < 1e-4:
-                                    break
+                            q_target = dls_ik_compute_qtarget(
+                                model, data, ee_body_id,
+                                arm_joint_ids, qpos_adrs, dof_adrs,
+                                p_des, q_des,
+                                rot_w=2.0,
+                                damping=3e-2,
+                                dt_step=dt_view,
+                                qd_max=qd_max,
+                                iters=iters,
+                            )
+                            data.ctrl[:7] = q_target
+
+                            for _ in range(n_sub):
+                                mujoco.mj_step(model, data)
 
                             viewer.sync()
 
-                            if renderer is not None:
-                                # ===== Wrist camera (same behavior as before) =====
-                                p_b = data.xpos[bracelet_body_id].copy()
-                                R_b = data.xmat[bracelet_body_id].reshape(3, 3).copy()
-                                p_frame = p_b + R_b @ cam_off
+                            # IMPORTANT: pump GUI events EVERY step
+                            if cv2 is not None:
+                                cv2.waitKey(1)
 
-                                R_frame = data.xmat[ee_body_id].reshape(3, 3).copy()
+                            if (renderer is not None) and ((i % render_every) == 0):
+                                # during transfer: fixed cam only, wrist optional
+                                render_windows(do_wrist=wrist_during_transfer, do_fixed=True)
 
-                                eye_out = 0.01
-                                eye_up = 0.0
-                                tool_forward = np.array([0.0, 0.0, -1.0], dtype=float)
-                                tool_up = np.array([0.0, -1.0, 0.0], dtype=float)
-
-                                p_frame = p_frame + (R_frame @ (tool_forward * eye_out)) + (R_frame @ (tool_up * eye_up))
-
-                                f_world = _normalize(R_frame @ tool_forward)
-                                u_world = _normalize(R_frame @ tool_up)
-
-                                z_cam_world = _normalize(-f_world)
-                                y_cam_world = _normalize(u_world - np.dot(u_world, z_cam_world) * z_cam_world)
-                                x_cam_world = _normalize(np.cross(y_cam_world, z_cam_world))
-                                y_cam_world = _normalize(np.cross(z_cam_world, x_cam_world))
-
-                                R_wc = np.column_stack([x_cam_world, y_cam_world, z_cam_world])
-
-                                model.cam_pos[wrist_cam_id] = p_frame
-                                model.cam_quat[wrist_cam_id] = quat_from_mat3(R_wc)
-
-                                renderer.update_scene(data, camera="wrist_rgb")
-                                wrist_rgb = renderer.render()
-                                wrist_bgr = wrist_rgb[..., ::-1]
-                                show_wrist_window(wrist_bgr, title="Wrist Camera", w=960, h=540)
-
-                                # ===== Fixed overhead camera window =====
-                                renderer.update_scene(data, camera="fixed_down")
-                                fixed_rgb = renderer.render()
-                                fixed_bgr = fixed_rgb[..., ::-1]
-                                show_wrist_window(fixed_bgr, title="Fixed Camera (Downward)", w=960, h=540)
-
-                            next_step_time += dt
-                            sleep_s = next_step_time - time.perf_counter()
-                            if sleep_s > 0:
-                                time.sleep(sleep_s)
+                            step_realtime()
 
         except KeyboardInterrupt:
             pass

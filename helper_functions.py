@@ -454,15 +454,36 @@ def draw_pip_border(viewer, x: int, y: int, w: int, h: int, thickness: int = 3):
     # and I’ll switch to an OpenGL-line overlay approach.
 
 
+# put this near your imports in helper_functions.py
+import numpy as np
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
+# cache created windows so we only set them up once
+__CV_WINDOWS = set()
+
 def show_wrist_window(img_rgb: np.ndarray, title: str = "Wrist Camera", w: int = 480, h: int = 360):
-    
     if cv2 is None:
         return
 
-    # resize
-    frame = cv2.resize(img_rgb, (w, h), interpolation=cv2.INTER_AREA)
+    # Create the window once (IMPORTANT on Windows)
+    if title not in __CV_WINDOWS:
+        cv2.namedWindow(title, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(title, w, h)
+        __CV_WINDOWS.add(title)
+
+    # Avoid resize if already correct size (saves a lot of time)
+    if img_rgb.shape[1] != w or img_rgb.shape[0] != h:
+        frame = cv2.resize(img_rgb, (w, h), interpolation=cv2.INTER_AREA)
+    else:
+        frame = img_rgb
 
     cv2.imshow(title, frame)
+
+    # Pump UI events
     cv2.waitKey(1)
 
 
