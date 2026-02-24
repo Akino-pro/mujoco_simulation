@@ -16,17 +16,18 @@ from helper_functions import (
 )
 
 try:
-    import cv2  # only used for JPEG encoding (no imshow here)
+    import cv2  # only used for JPEG encoding
 except Exception:
     cv2 = None
 
-URDF_PATH = r"gen3_modified.urdf"
+URDF_PATH = r"robot/gen3_modified.urdf"
+SCENE_XML = r"robotsuit_cubes.xml"
 
 HOST = "127.0.0.1"
-PORT = 5005
+PORT_RGB = 5005
 
 RENDER_W, RENDER_H = 480, 480
-WRIST_REFRESH_EVERY = 2  # send every N frames to reduce load
+WRIST_REFRESH_EVERY = 2
 JPEG_QUALITY = 80
 
 
@@ -67,6 +68,35 @@ def _normalize(v: np.ndarray) -> np.ndarray:
     return v / nrm
 
 
+def lookat_quat_from_tool_axes(
+    p_tool: np.ndarray,
+    p_target: np.ndarray,
+    tool_forward_local: np.ndarray,
+    tool_up_local: np.ndarray,
+    world_up: np.ndarray = np.array([0.0, 0.0, 1.0], dtype=float),
+) -> np.ndarray:
+    # desired forward direction in world
+    f = p_target - p_tool
+    f = _normalize(f)
+
+    # choose an up direction in world that is orthogonal to f
+    u = world_up - np.dot(world_up, f) * f
+    u = _normalize(u)
+
+    # right-handed basis
+    r = _normalize(np.cross(u, f))
+    u = _normalize(np.cross(f, r))
+
+    # local basis from tool axes
+    tf = _normalize(tool_forward_local)
+    tu = _normalize(tool_up_local)
+    tr = _normalize(np.cross(tu, tf))  # local right
+
+    # map local basis -> world basis
+    R_world = np.column_stack([r, u, f]) @ np.linalg.inv(np.column_stack([tr, tu, tf]))
+    return quat_from_mat3(R_world)
+
+
 class FrameSender:
     """Length-prefixed TCP sender. Sends bytes payloads to localhost receiver."""
     def __init__(self, host: str, port: int):
@@ -88,13 +118,13 @@ class FrameSender:
 
 def main():
     if cv2 is None:
-        raise RuntimeError("opencv-python is required in sender for JPEG encoding (cv2.imencode).")
+        raise RuntimeError("opencv-python is required for JPEG encoding (cv2.imencode).")
 
     urdf_abs = os.path.abspath(URDF_PATH)
     urdf_dir = os.path.dirname(urdf_abs)
     os.chdir(urdf_dir)
 
-    # load URDF via importer (kept for your pipeline)
+    # keep your pipeline step
     robot_model = mujoco.MjModel.from_xml_path(urdf_abs)
     robot_mjcf_path = os.path.join(urdf_dir, "_gen3_from_urdf.xml")
     mujoco.mj_saveLastXML(robot_mjcf_path, robot_model)
@@ -103,15 +133,22 @@ def main():
     _ = _ensure_nonempty_asset_children(_extract_tag_inner(robot_text, "asset"))
     _ = _ensure_nonempty_body_children(_extract_tag_inner(robot_text, "worldbody"))
 
-    scene_path = os.path.join(urdf_dir, "robotsuit_cubes.xml")
-    model = mujoco.MjModel.from_xml_path(scene_path)
+    scene_path = os.path.join(urdf_dir, SCENE_XML)
+    model = mujoco.MjModel.from_xml_path(os.path.abspath(SCENE_XML))
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
 
+    # camera id
     wrist_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_rgb")
     if wrist_cam_id < 0:
         raise RuntimeError("Camera 'wrist_rgb' not found in model XML")
     wrist_cam_id = int(wrist_cam_id)
+
+    # tomato look-at site id
+    tomato_site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "tomato_aim")
+    if tomato_site_id < 0:
+        raise RuntimeError("Site 'tomato_aim' not found. Did you add it to robotsuit_cubes.xml?")
+    tomato_site_id = int(tomato_site_id)
 
     # Arm joints + EEF body
     arm_joint_names = [f"gen3_joint_{i}" for i in range(1, 8)]
@@ -133,7 +170,7 @@ def main():
 
     renderer = mujoco.Renderer(model, width=RENDER_W, height=RENDER_H)
 
-    sender = FrameSender(HOST, PORT)
+    sender_rgb = FrameSender(HOST, PORT_RGB)
 
     # IK timing
     dt = 1.0 / 60.0
@@ -214,7 +251,16 @@ def main():
 
                             s = i / (n - 1)
                             p_des = (1.0 - s) * p0 + s * p1
-                            q_des = q_hold
+
+                            p_target = data.site_xpos[tomato_site_id].copy()
+                            p_tool = data.xpos[ee_body_id].copy()
+
+                            q_des = lookat_quat_from_tool_axes(
+                                p_tool=p_tool,
+                                p_target=p_target,
+                                tool_forward_local=tool_forward,
+                                tool_up_local=tool_up
+                            )
 
                             g += float(cmd) * GRIP_SPEED * dt
                             g = float(np.clip(g, 0.0, 1.0))
@@ -256,20 +302,25 @@ def main():
 
                             viewer.sync()
 
-                            # ---- send wrist frame ----
+                            # ---- send wrist RGB frame ----
                             frame_counter += 1
                             if (frame_counter % WRIST_REFRESH_EVERY) == 0:
                                 renderer.update_scene(data, camera="wrist_rgb")
                                 wrist_rgb = renderer.render()
-
                                 if wrist_rgb.dtype != np.uint8:
                                     wrist_rgb = np.clip(wrist_rgb, 0, 255).astype(np.uint8)
-
-                                # encode JPEG (OpenCV expects BGR)
                                 wrist_bgr = wrist_rgb[:, :, ::-1]
-                                ok, buf = cv2.imencode(".jpg", wrist_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+
+                                ok, buf = cv2.imencode(
+                                    ".jpg", wrist_bgr,
+                                    [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+                                )
                                 if ok:
-                                    sender.send(buf.tobytes())
+                                    try:
+                                        sender_rgb.send(buf.tobytes())
+                                    except BrokenPipeError:
+                                        print("[WARN] RGB receiver disconnected (BrokenPipe). Start MAC2.py first.")
+                                        return
 
                             next_step_time += dt
                             sleep_s = next_step_time - time.perf_counter()
@@ -286,7 +337,16 @@ def main():
 
                             s = i / (n - 1)
                             p_des = bezier(p0, p1, p2, p3, s)
-                            q_des = q_hold
+
+                            p_target = data.site_xpos[tomato_site_id].copy()
+                            p_tool = data.xpos[ee_body_id].copy()
+
+                            q_des = lookat_quat_from_tool_axes(
+                                p_tool=p_tool,
+                                p_target=p_target,
+                                tool_forward_local=tool_forward,
+                                tool_up_local=tool_up
+                            )
 
                             g += float(cmd) * GRIP_SPEED * dt
                             g = float(np.clip(g, 0.0, 1.0))
@@ -333,11 +393,18 @@ def main():
                                 wrist_rgb = renderer.render()
                                 if wrist_rgb.dtype != np.uint8:
                                     wrist_rgb = np.clip(wrist_rgb, 0, 255).astype(np.uint8)
-
                                 wrist_bgr = wrist_rgb[:, :, ::-1]
-                                ok, buf = cv2.imencode(".jpg", wrist_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+
+                                ok, buf = cv2.imencode(
+                                    ".jpg", wrist_bgr,
+                                    [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+                                )
                                 if ok:
-                                    sender.send(buf.tobytes())
+                                    try:
+                                        sender_rgb.send(buf.tobytes())
+                                    except BrokenPipeError:
+                                        print("[WARN] RGB receiver disconnected (BrokenPipe). Start MAC2.py first.")
+                                        return
 
                             next_step_time += dt
                             sleep_s = next_step_time - time.perf_counter()
@@ -351,7 +418,7 @@ def main():
                 renderer.close()
             except Exception:
                 pass
-            sender.close()
+            sender_rgb.close()
 
 
 if __name__ == "__main__":
