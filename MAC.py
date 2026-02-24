@@ -122,7 +122,7 @@ def main():
 
     urdf_abs = os.path.abspath(URDF_PATH)
     urdf_dir = os.path.dirname(urdf_abs)
-    os.chdir(urdf_dir)
+
 
     # keep your pipeline step
     robot_model = mujoco.MjModel.from_xml_path(urdf_abs)
@@ -133,8 +133,8 @@ def main():
     _ = _ensure_nonempty_asset_children(_extract_tag_inner(robot_text, "asset"))
     _ = _ensure_nonempty_body_children(_extract_tag_inner(robot_text, "worldbody"))
 
-    scene_path = os.path.join(urdf_dir, SCENE_XML)
-    model = mujoco.MjModel.from_xml_path(os.path.abspath(SCENE_XML))
+    scene_abs = os.path.abspath(SCENE_XML)
+    model = mujoco.MjModel.from_xml_path(scene_abs)
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
 
