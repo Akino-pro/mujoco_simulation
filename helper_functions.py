@@ -1025,3 +1025,19 @@ def viewer_use_fixed_camera(viewer, cam_id: int):
 def viewer_use_free_camera(viewer):
     viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
 
+def depth_to_vis(depth_map: np.ndarray, max_depth=1.5, use_colormap=True) -> np.ndarray:
+    """
+    depth_map: float array in meters (MuJoCo depth rendering)
+    returns: BGR uint8 image for cv2.imshow / your show_wrist_window()
+    """
+    depth_u8 = np.clip((depth_map / float(max_depth)) * 255.0, 0, 255).astype(np.uint8)
+
+    if cv2 is None:
+        # fallback: grayscale
+        return np.stack([depth_u8, depth_u8, depth_u8], axis=-1)
+
+    if use_colormap:
+        return cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET)  # BGR
+    else:
+        return np.stack([depth_u8, depth_u8, depth_u8], axis=-1)
+

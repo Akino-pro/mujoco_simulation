@@ -7,7 +7,7 @@ import mujoco.viewer
 from helper_functions import (
     _get_joint_ids_by_name, find_ee_target, build_gripper_controls, quat_from_mat3,
     set_white_environment_visuals, apply_gripper, show_wrist_window,
-    make_R_with_axis_k_down
+    make_R_with_axis_k_down, depth_to_vis
 )
 
 try:
@@ -149,6 +149,11 @@ def main():
         # smaller = less chance of falling behind
         renderer = mujoco.Renderer(model, width=960, height=540)
 
+    renderer_depth = None
+    if cv2 is not None:
+        renderer_depth = mujoco.Renderer(model, width=960, height=540)
+        renderer_depth.enable_depth_rendering()
+
     dt_view = 1.0 / 60.0
 
     IK_ITERS_NEAR = 12
@@ -205,7 +210,11 @@ def main():
         if renderer is None:
             return
 
+        MAX_DEPTH_WRIST = 1.0
+        MAX_DEPTH_FIXED = 2.5
+
         if do_wrist:
+            # --- wrist pose update (your existing code) ---
             p_b = data.xpos[bracelet_body_id].copy()
             R_b = data.xmat[bracelet_body_id].reshape(3, 3).copy()
             p_frame = p_b + R_b @ cam_off
@@ -230,14 +239,30 @@ def main():
             model.cam_pos[wrist_cam_id] = p_frame
             model.cam_quat[wrist_cam_id] = quat_from_mat3(R_wc)
 
+            # --- wrist RGB ---
             renderer.update_scene(data, camera="wrist_rgb")
             wrist_rgb = renderer.render()
-            show_wrist_window(wrist_rgb[..., ::-1], title="Wrist Camera", w=960, h=540)
+            show_wrist_window(wrist_rgb[..., ::-1], title="Wrist Camera (RGB)", w=960, h=540)
+
+            # --- wrist Depth ---
+            if renderer_depth is not None:
+                renderer_depth.update_scene(data, camera="wrist_rgb")
+                wrist_depth = renderer_depth.render()  # float meters
+                wrist_depth_vis = depth_to_vis(wrist_depth, max_depth=MAX_DEPTH_WRIST, use_colormap=True)
+                show_wrist_window(wrist_depth_vis, title="Wrist Camera (Depth)", w=960, h=540)
 
         if do_fixed:
+            # --- fixed RGB ---
             renderer.update_scene(data, camera="fixed_down")
             fixed_rgb = renderer.render()
-            show_wrist_window(fixed_rgb[..., ::-1], title="Fixed Camera (Downward)", w=960, h=540)
+            show_wrist_window(fixed_rgb[..., ::-1], title="Fixed Camera (RGB)", w=960, h=540)
+
+            # --- fixed Depth ---
+            if renderer_depth is not None:
+                renderer_depth.update_scene(data, camera="fixed_down")
+                fixed_depth = renderer_depth.render()
+                fixed_depth_vis = depth_to_vis(fixed_depth, max_depth=MAX_DEPTH_FIXED, use_colormap=True)
+                show_wrist_window(fixed_depth_vis, title="Fixed Camera (Depth)", w=960, h=540)
 
     def step_realtime():
         nonlocal next_step_time
