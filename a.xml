@@ -40,19 +40,19 @@ rgb1="0.9 0.9 1" rgb2="0.2 0.3 0.4" width="256" height="1536"/>
 
 <texture type="2d" colorspace="sRGB" name="texplane"
 
-file="robosuite/models/assets/textures/light-gray-floor-tile.png"/>
+file="textures/light-gray-floor-tile.png"/>
 
 <texture type="cube" colorspace="linear" name="tex-ceramic"
 
-file="robosuite/models/assets/textures/ceramic.png"/>
+file="textures/ceramic.png"/>
 
 <texture type="cube" colorspace="linear" name="tex-steel-brushed"
 
-file="robosuite/models/assets/textures/steel-brushed.png"/>
+file="textures/steel-brushed.png"/>
 
 <texture type="2d" colorspace="linear" name="tex-light-gray-plaster"
 
-file="robosuite/models/assets/textures/light-gray-plaster.png"/>
+file="textures/light-gray-plaster.png"/>
 
 
 
