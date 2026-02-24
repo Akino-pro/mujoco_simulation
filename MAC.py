@@ -21,7 +21,7 @@ except Exception:
     cv2 = None
 
 URDF_PATH = r"robot/gen3_modified.urdf"
-SCENE_XML = r"robotsuit_cubes.xml"
+SCENE_XML = r"A.xml"
 
 HOST = "127.0.0.1"
 PORT_RGB = 5005
@@ -170,6 +170,10 @@ def main():
 
     renderer = mujoco.Renderer(model, width=RENDER_W, height=RENDER_H)
 
+    # [新增] 专门用于提取深度图的渲染器
+    renderer_depth = mujoco.Renderer(model, width=RENDER_W, height=RENDER_H)
+    renderer_depth.enable_depth_rendering()
+
     sender_rgb = FrameSender(HOST, PORT_RGB)
 
     # IK timing
@@ -305,14 +309,32 @@ def main():
                             # ---- send wrist RGB frame ----
                             frame_counter += 1
                             if (frame_counter % WRIST_REFRESH_EVERY) == 0:
+                                # 1. 渲染 RGB
                                 renderer.update_scene(data, camera="wrist_rgb")
                                 wrist_rgb = renderer.render()
                                 if wrist_rgb.dtype != np.uint8:
                                     wrist_rgb = np.clip(wrist_rgb, 0, 255).astype(np.uint8)
                                 wrist_bgr = wrist_rgb[:, :, ::-1]
 
+                                # 2. [新增] 渲染 深度图 (Depth)
+                                renderer_depth.update_scene(data, camera="wrist_rgb")
+                                depth_map = renderer_depth.render()  # 返回的是真实物理距离（米）的浮点数组
+
+                                # 将深度距离映射为 0-255 的可视图像。
+                                # 这里设置 MAX_DEPTH=1.5 米，意味着距离相机 1.5 米外的物体都会显示为最大颜色。
+                                # 扫描西红柿时距离通常很近，你可以根据实际效果微调这个 1.5 的值。
+                                MAX_DEPTH = 1.5
+                                depth_norm = np.clip((depth_map / MAX_DEPTH) * 255.0, 0, 255).astype(np.uint8)
+
+                                # 给深度图加上伪彩色（JET色带），视觉效果会非常专业（红-黄-绿-蓝）
+                                depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_JET)
+
+                                # 3. [新增] 将 RGB 和 深度图 左右拼接起来
+                                combined_img = np.hstack((wrist_bgr, depth_color))
+
+                                # 4. 压缩并发送这张长图
                                 ok, buf = cv2.imencode(
-                                    ".jpg", wrist_bgr,
+                                    ".jpg", combined_img,
                                     [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
                                 )
                                 if ok:
@@ -389,14 +411,32 @@ def main():
 
                             frame_counter += 1
                             if (frame_counter % WRIST_REFRESH_EVERY) == 0:
+                                # 1. 渲染 RGB
                                 renderer.update_scene(data, camera="wrist_rgb")
                                 wrist_rgb = renderer.render()
                                 if wrist_rgb.dtype != np.uint8:
                                     wrist_rgb = np.clip(wrist_rgb, 0, 255).astype(np.uint8)
                                 wrist_bgr = wrist_rgb[:, :, ::-1]
 
+                                # 2. [新增] 渲染 深度图 (Depth)
+                                renderer_depth.update_scene(data, camera="wrist_rgb")
+                                depth_map = renderer_depth.render()  # 返回的是真实物理距离（米）的浮点数组
+
+                                # 将深度距离映射为 0-255 的可视图像。
+                                # 这里设置 MAX_DEPTH=1.5 米，意味着距离相机 1.5 米外的物体都会显示为最大颜色。
+                                # 扫描西红柿时距离通常很近，你可以根据实际效果微调这个 1.5 的值。
+                                MAX_DEPTH = 1.5
+                                depth_norm = np.clip((depth_map / MAX_DEPTH) * 255.0, 0, 255).astype(np.uint8)
+
+                                # 给深度图加上伪彩色（JET色带），视觉效果会非常专业（红-黄-绿-蓝）
+                                depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_JET)
+
+                                # 3. [新增] 将 RGB 和 深度图 左右拼接起来
+                                combined_img = np.hstack((wrist_bgr, depth_color))
+
+                                # 4. 压缩并发送这张长图
                                 ok, buf = cv2.imencode(
-                                    ".jpg", wrist_bgr,
+                                    ".jpg", combined_img,
                                     [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
                                 )
                                 if ok:
