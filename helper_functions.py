@@ -1041,3 +1041,33 @@ def depth_to_vis(depth_map: np.ndarray, max_depth=1.5, use_colormap=True) -> np.
     else:
         return np.stack([depth_u8, depth_u8, depth_u8], axis=-1)
 
+
+def depth_to_point_cloud_with_color(depth_map: np.ndarray, rgb_img: np.ndarray, fovy_deg: float):
+    """
+    将 MuJoCo 的深度图和 RGB 图转换为带颜色的 3D 点云。
+    """
+    H, W = depth_map.shape
+    fovy_rad = np.deg2rad(fovy_deg)
+    f_y = (H / 2.0) / np.tan(fovy_rad / 2.0)
+    f_x = f_y
+    c_x = W / 2.0
+    c_y = H / 2.0
+
+    u, v = np.meshgrid(np.arange(W), np.arange(H))
+    valid_mask = (depth_map > 0.01) & (depth_map < 3.0)
+
+    Z = depth_map[valid_mask]
+    u_valid = u[valid_mask]
+    v_valid = v[valid_mask]
+
+    # 算 X 和 Y
+    X = (u_valid - c_x) * Z / f_x
+    Y = (v_valid - c_y) * Z / f_y
+
+    # 在 Open3D 中，通常需要翻转 Y 和 Z 轴才能让画面正过来 (相机坐标系习惯不同)
+    points = np.column_stack((X, -Y, -Z))
+
+    # 提取颜色并归一化到 0-1 之间 (Open3D 颜色格式要求)
+    colors = rgb_img[valid_mask] / 255.0
+
+    return points, colors

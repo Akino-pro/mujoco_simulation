@@ -12,7 +12,7 @@ import mujoco.viewer
 from helper_functions import (
     _get_joint_ids_by_name, find_ee_target, build_gripper_controls, quat_from_mat3,
     set_white_environment_visuals, ik_step_dls, apply_gripper,
-    make_R_with_axis_k_down
+    make_R_with_axis_k_down, depth_to_point_cloud_with_color  # [新增] 引入我们写的数学函数
 )
 
 try:
@@ -20,8 +20,8 @@ try:
 except Exception:
     cv2 = None
 
-URDF_PATH = r"robot/gen3_modified.urdf"
-SCENE_XML = r"A.xml"
+URDF_PATH = r"gen3_modified.urdf"
+SCENE_XML = r"a.xml"
 
 HOST = "127.0.0.1"
 PORT_RGB = 5005
@@ -42,7 +42,7 @@ def _extract_tag_inner(text: str, tag: str) -> str:
 
 
 def _strip_comments(s: str) -> str:
-    return re.sub(r"<!--.*?-->", "", s or "", flags=re.DOTALL)
+    return re.sub(r"", "", s or "", flags=re.DOTALL)
 
 
 def _ensure_nonempty_asset_children(asset_inner: str) -> str:
@@ -69,36 +69,28 @@ def _normalize(v: np.ndarray) -> np.ndarray:
 
 
 def lookat_quat_from_tool_axes(
-    p_tool: np.ndarray,
-    p_target: np.ndarray,
-    tool_forward_local: np.ndarray,
-    tool_up_local: np.ndarray,
-    world_up: np.ndarray = np.array([0.0, 0.0, 1.0], dtype=float),
+        p_tool: np.ndarray,
+        p_target: np.ndarray,
+        tool_forward_local: np.ndarray,
+        tool_up_local: np.ndarray,
+        world_up: np.ndarray = np.array([0.0, 0.0, 1.0], dtype=float),
 ) -> np.ndarray:
-    # desired forward direction in world
     f = p_target - p_tool
     f = _normalize(f)
-
-    # choose an up direction in world that is orthogonal to f
     u = world_up - np.dot(world_up, f) * f
     u = _normalize(u)
-
-    # right-handed basis
     r = _normalize(np.cross(u, f))
     u = _normalize(np.cross(f, r))
 
-    # local basis from tool axes
     tf = _normalize(tool_forward_local)
     tu = _normalize(tool_up_local)
-    tr = _normalize(np.cross(tu, tf))  # local right
+    tr = _normalize(np.cross(tu, tf))
 
-    # map local basis -> world basis
     R_world = np.column_stack([r, u, f]) @ np.linalg.inv(np.column_stack([tr, tu, tf]))
     return quat_from_mat3(R_world)
 
 
 class FrameSender:
-    """Length-prefixed TCP sender. Sends bytes payloads to localhost receiver."""
     def __init__(self, host: str, port: int):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -106,7 +98,7 @@ class FrameSender:
         print(f"[INFO] Connected to wrist receiver at {host}:{port}")
 
     def send(self, payload: bytes):
-        header = struct.pack("!I", len(payload))  # 4-byte big-endian length
+        header = struct.pack("!I", len(payload))
         self.sock.sendall(header + payload)
 
     def close(self):
@@ -122,35 +114,24 @@ def main():
 
     urdf_abs = os.path.abspath(URDF_PATH)
     urdf_dir = os.path.dirname(urdf_abs)
+    os.chdir(urdf_dir)
 
 
-    # keep your pipeline step
-    robot_model = mujoco.MjModel.from_xml_path(urdf_abs)
-    robot_mjcf_path = os.path.join(urdf_dir, "_gen3_from_urdf.xml")
-    mujoco.mj_saveLastXML(robot_mjcf_path, robot_model)
-
-    robot_text = Path(robot_mjcf_path).read_text(encoding="utf-8", errors="ignore")
-    _ = _ensure_nonempty_asset_children(_extract_tag_inner(robot_text, "asset"))
-    _ = _ensure_nonempty_body_children(_extract_tag_inner(robot_text, "worldbody"))
-
-    scene_abs = os.path.abspath(SCENE_XML)
-    model = mujoco.MjModel.from_xml_path(scene_abs)
+    scene_path = os.path.join(urdf_dir, SCENE_XML)
+    model = mujoco.MjModel.from_xml_path(scene_path)
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
 
-    # camera id
     wrist_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_rgb")
     if wrist_cam_id < 0:
         raise RuntimeError("Camera 'wrist_rgb' not found in model XML")
     wrist_cam_id = int(wrist_cam_id)
 
-    # tomato look-at site id
     tomato_site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "tomato_aim")
     if tomato_site_id < 0:
-        raise RuntimeError("Site 'tomato_aim' not found. Did you add it to robotsuit_cubes.xml?")
+        raise RuntimeError("Site 'tomato_aim' not found.")
     tomato_site_id = int(tomato_site_id)
 
-    # Arm joints + EEF body
     arm_joint_names = [f"gen3_joint_{i}" for i in range(1, 8)]
     arm_joint_ids = _get_joint_ids_by_name(model, arm_joint_names)
     qpos_adrs = [int(model.jnt_qposadr[j]) for j in arm_joint_ids]
@@ -168,30 +149,30 @@ def main():
 
     cam_off = np.array([0.0, -0.06841, -0.05044], dtype=float)
 
+    # ================= 修改处：添加深度渲染器 =================
     renderer = mujoco.Renderer(model, width=RENDER_W, height=RENDER_H)
-
-    # [新增] 专门用于提取深度图的渲染器
     renderer_depth = mujoco.Renderer(model, width=RENDER_W, height=RENDER_H)
     renderer_depth.enable_depth_rendering()
 
     sender_rgb = FrameSender(HOST, PORT_RGB)
 
-    # IK timing
     dt = 1.0 / 60.0
     IK_ITERS = 10
     qd_safe = np.deg2rad(10.0)
     qd_max = np.full(7, qd_safe, dtype=float)
     dt_inner = dt / IK_ITERS
 
-    # Path / motion
-    p_green = np.array([0.45, 0.18, 0.825], dtype=float)
-    p_blue  = np.array([0.45, -0.18, 0.825], dtype=float)
-    z_above = 0.98
-    z_pick  = 0.86
+    # Path / motion (已为西红柿扫描调整)
+    # X 从 0.45 增加到 0.60，让机械臂往前靠，离西红柿（X=0.9）更近
+    p_green = np.array([0.60, 0.18, 0.825], dtype=float)
+    p_blue = np.array([0.60, -0.18, 0.825], dtype=float)
+
+    # 高度 Z 整体拔高约 0.4 米，来到西红柿的视平线
+    z_above = 1.35
+    z_pick = 1.25
 
     R0 = data.xmat[ee_body_id].reshape(3, 3).copy()
     R_des, k_up = make_R_with_axis_k_down(R0)
-    q_hold = quat_from_mat3(R_des)
     print(f"[INFO] EE axis pointing up at start was body axis index {k_up} (0=x,1=y,2=z). Forcing it to point down.")
 
     def bezier(p0, p1, p2, p3, s):
@@ -206,9 +187,10 @@ def main():
     pB1 = np.array([p_blue[0], p_blue[1], z_pick], dtype=float)
     pB2 = np.array([p_blue[0], p_blue[1], z_above], dtype=float)
 
-    mid_z = 1.10
+    # 曲线过渡的中间点也要跟着拔高
+    mid_z = 1.45
     c1 = np.array([p_green[0], 0.00, mid_z], dtype=float)
-    c2 = np.array([p_blue[0],  0.00, mid_z], dtype=float)
+    c2 = np.array([p_blue[0], 0.00, mid_z], dtype=float)
 
     segments = [
         ("lin", pA0, pA0, 1.0, 0),
@@ -226,9 +208,9 @@ def main():
     GRIP_SPEED = 0.9
 
     tool_forward = np.array([0.0, 0.0, -1.0], dtype=float)
-    tool_up      = np.array([0.0, -1.0,  0.0], dtype=float)
+    tool_up = np.array([0.0, -1.0, 0.0], dtype=float)
     eye_out = 0.01
-    eye_up  = 0.0
+    eye_up = 0.0
 
     frame_counter = 0
 
@@ -283,7 +265,6 @@ def main():
                                 if err < 1e-4:
                                     break
 
-                            # ---- wrist cam pose ----
                             p_b = data.xpos[bracelet_body_id].copy()
                             R_b = data.xmat[bracelet_body_id].reshape(3, 3).copy()
                             p_frame = p_b + R_b @ cam_off
@@ -301,38 +282,30 @@ def main():
 
                             R_wc = np.column_stack([x_cam_world, y_cam_world, z_cam_world])
 
-                            model.cam_pos[wrist_cam_id]  = p_frame
+                            model.cam_pos[wrist_cam_id] = p_frame
                             model.cam_quat[wrist_cam_id] = quat_from_mat3(R_wc)
 
                             viewer.sync()
 
-                            # ---- send wrist RGB frame ----
                             frame_counter += 1
                             if (frame_counter % WRIST_REFRESH_EVERY) == 0:
-                                # 1. 渲染 RGB
+                                # ========================================
+                                # 渲染RGB和Depth并拼接发送，同时录制点云
+                                # ========================================
                                 renderer.update_scene(data, camera="wrist_rgb")
                                 wrist_rgb = renderer.render()
                                 if wrist_rgb.dtype != np.uint8:
                                     wrist_rgb = np.clip(wrist_rgb, 0, 255).astype(np.uint8)
                                 wrist_bgr = wrist_rgb[:, :, ::-1]
 
-                                # 2. [新增] 渲染 深度图 (Depth)
                                 renderer_depth.update_scene(data, camera="wrist_rgb")
-                                depth_map = renderer_depth.render()  # 返回的是真实物理距离（米）的浮点数组
+                                depth_map = renderer_depth.render()
 
-                                # 将深度距离映射为 0-255 的可视图像。
-                                # 这里设置 MAX_DEPTH=1.5 米，意味着距离相机 1.5 米外的物体都会显示为最大颜色。
-                                # 扫描西红柿时距离通常很近，你可以根据实际效果微调这个 1.5 的值。
                                 MAX_DEPTH = 1.5
                                 depth_norm = np.clip((depth_map / MAX_DEPTH) * 255.0, 0, 255).astype(np.uint8)
-
-                                # 给深度图加上伪彩色（JET色带），视觉效果会非常专业（红-黄-绿-蓝）
                                 depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_JET)
-
-                                # 3. [新增] 将 RGB 和 深度图 左右拼接起来
                                 combined_img = np.hstack((wrist_bgr, depth_color))
 
-                                # 4. 压缩并发送这张长图
                                 ok, buf = cv2.imencode(
                                     ".jpg", combined_img,
                                     [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
@@ -343,6 +316,11 @@ def main():
                                     except BrokenPipeError:
                                         print("[WARN] RGB receiver disconnected (BrokenPipe). Start MAC2.py first.")
                                         return
+
+                                # 生成点云并保存（每次循环覆盖，最终得到结束前的一帧）
+                                pts, clrs = depth_to_point_cloud_with_color(depth_map, wrist_rgb, fovy_deg=60.0)
+                                np.savez("tomato_scan.npz", points=pts, colors=clrs)
+                                # ========================================
 
                             next_step_time += dt
                             sleep_s = next_step_time - time.perf_counter()
@@ -404,37 +382,30 @@ def main():
 
                             R_wc = np.column_stack([x_cam_world, y_cam_world, z_cam_world])
 
-                            model.cam_pos[wrist_cam_id]  = p_frame
+                            model.cam_pos[wrist_cam_id] = p_frame
                             model.cam_quat[wrist_cam_id] = quat_from_mat3(R_wc)
 
                             viewer.sync()
 
                             frame_counter += 1
                             if (frame_counter % WRIST_REFRESH_EVERY) == 0:
-                                # 1. 渲染 RGB
+                                # ========================================
+                                # 渲染RGB和Depth并拼接发送，同时录制点云
+                                # ========================================
                                 renderer.update_scene(data, camera="wrist_rgb")
                                 wrist_rgb = renderer.render()
                                 if wrist_rgb.dtype != np.uint8:
                                     wrist_rgb = np.clip(wrist_rgb, 0, 255).astype(np.uint8)
                                 wrist_bgr = wrist_rgb[:, :, ::-1]
 
-                                # 2. [新增] 渲染 深度图 (Depth)
                                 renderer_depth.update_scene(data, camera="wrist_rgb")
-                                depth_map = renderer_depth.render()  # 返回的是真实物理距离（米）的浮点数组
+                                depth_map = renderer_depth.render()
 
-                                # 将深度距离映射为 0-255 的可视图像。
-                                # 这里设置 MAX_DEPTH=1.5 米，意味着距离相机 1.5 米外的物体都会显示为最大颜色。
-                                # 扫描西红柿时距离通常很近，你可以根据实际效果微调这个 1.5 的值。
                                 MAX_DEPTH = 1.5
                                 depth_norm = np.clip((depth_map / MAX_DEPTH) * 255.0, 0, 255).astype(np.uint8)
-
-                                # 给深度图加上伪彩色（JET色带），视觉效果会非常专业（红-黄-绿-蓝）
                                 depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_JET)
-
-                                # 3. [新增] 将 RGB 和 深度图 左右拼接起来
                                 combined_img = np.hstack((wrist_bgr, depth_color))
 
-                                # 4. 压缩并发送这张长图
                                 ok, buf = cv2.imencode(
                                     ".jpg", combined_img,
                                     [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
@@ -445,6 +416,11 @@ def main():
                                     except BrokenPipeError:
                                         print("[WARN] RGB receiver disconnected (BrokenPipe). Start MAC2.py first.")
                                         return
+
+                                # 生成点云并保存（每次循环覆盖，最终得到结束前的一帧）
+                                pts, clrs = depth_to_point_cloud_with_color(depth_map, wrist_rgb, fovy_deg=60.0)
+                                np.savez("tomato_scan.npz", points=pts, colors=clrs)
+                                # ========================================
 
                             next_step_time += dt
                             sleep_s = next_step_time - time.perf_counter()
@@ -458,7 +434,14 @@ def main():
                 renderer.close()
             except Exception:
                 pass
-            sender_rgb.close()
+            try:
+                renderer_depth.close()
+            except Exception:
+                pass
+            try:
+                sender_rgb.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
