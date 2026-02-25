@@ -1,5 +1,6 @@
 import os
 import time
+import argparse
 import numpy as np
 import mujoco
 import mujoco.viewer
@@ -16,6 +17,65 @@ except Exception:
     cv2 = None
 
 URDF_PATH = r"gen3_modified.urdf"
+
+
+def _resolve_scene_path(urdf_dir: str) -> str:
+    env_scene = os.environ.get("MUJOCO_SCENE_XML", "").strip()
+    if env_scene:
+        scene = env_scene if os.path.isabs(env_scene) else os.path.join(urdf_dir, env_scene)
+        if not os.path.exists(scene):
+            raise FileNotFoundError(f"MUJOCO_SCENE_XML points to missing file: {scene}")
+        print(f"[INFO] Using scene from MUJOCO_SCENE_XML: {scene}")
+        return scene
+
+    convex_scene = os.path.join(urdf_dir, "robotsuit_convex.xml")
+    cubes_scene = os.path.join(urdf_dir, "robotsuit_cubes.xml")
+    if os.path.exists(convex_scene):
+        print(f"[INFO] Using convex scene: {convex_scene}")
+        return convex_scene
+    print(f"[INFO] Using cube-proxy scene: {cubes_scene}")
+    return cubes_scene
+
+
+def _resolve_collision_viz_choice() -> bool:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--collision-viz",
+        type=str,
+        default="",
+        help="Collision visualization mode: 1/off/hide or 2/on/show.",
+    )
+    args, _ = parser.parse_known_args()
+    raw = str(args.collision_viz).strip().lower()
+
+    if raw in {"1", "off", "hide"}:
+        return False
+    if raw in {"2", "on", "show"}:
+        return True
+
+    print("[SELECT] Collision visualization mode:")
+    print("  1) Hide collision boxes/meshes")
+    print("  2) Show collision boxes/meshes (current behavior)")
+    while True:
+        choice = input("Enter 1 or 2 (default 2): ").strip()
+        if choice == "":
+            return True
+        if choice == "1":
+            return False
+        if choice == "2":
+            return True
+        print("Please enter 1 or 2.")
+
+
+def _apply_collision_viz_mode(model: mujoco.MjModel, show_collision_viz: bool):
+    if show_collision_viz:
+        return
+    for gid in range(model.ngeom):
+        gname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid)
+        if not gname:
+            continue
+        if "_col" in gname:
+            model.geom_rgba[gid, 3] = 0.0
 
 
 def _normalize(v: np.ndarray) -> np.ndarray:
@@ -110,12 +170,16 @@ def dls_ik_compute_qtarget(
 
 
 def main():
+    show_collision_viz = _resolve_collision_viz_choice()
+    print(f"[INFO] Collision visualization: {'ON' if show_collision_viz else 'OFF'}")
+
     urdf_abs = os.path.abspath(URDF_PATH)
     urdf_dir = os.path.dirname(urdf_abs)
     os.chdir(urdf_dir)
 
-    scene_path = os.path.join(urdf_dir, "robotsuit_cubes.xml")
+    scene_path = _resolve_scene_path(urdf_dir)
     model = mujoco.MjModel.from_xml_path(scene_path)
+    _apply_collision_viz_mode(model, show_collision_viz)
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
 
@@ -175,7 +239,16 @@ def main():
         if gid >= 0:
             model.geom_friction[int(gid), :] = np.array([slide, spin, roll], dtype=float)
 
+    def _set_geom_friction_prefix(prefix: str, slide=3.0, spin=0.03, roll=0.002):
+        for gid in range(model.ngeom):
+            gname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid)
+            if gname and gname.startswith(prefix):
+                model.geom_friction[gid, :] = np.array([slide, spin, roll], dtype=float)
+
     _set_geom_friction("big_bear_col", slide=4.0, spin=0.04, roll=0.003)
+    _set_geom_friction_prefix("big_bear_col_part_", slide=4.0, spin=0.04, roll=0.003)
+    _set_geom_friction("cardboard_col", slide=3.2, spin=0.03, roll=0.002)
+    _set_geom_friction_prefix("cardboard_col_part_", slide=3.2, spin=0.03, roll=0.002)
     _set_geom_friction("left_fingertip_col", slide=4.0, spin=0.04, roll=0.003)
     _set_geom_friction("right_fingertip_col", slide=4.0, spin=0.04, roll=0.003)
 
