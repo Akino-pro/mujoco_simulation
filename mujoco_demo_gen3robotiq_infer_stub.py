@@ -145,6 +145,23 @@ def rotvec_to_quat(r: np.ndarray) -> np.ndarray:
     return np.array([np.cos(0.5 * angle), axis[0] * s, axis[1] * s, axis[2] * s], dtype=float)
 
 
+def rpy_to_quat(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    cr, sr = np.cos(0.5 * roll), np.sin(0.5 * roll)
+    cp, sp = np.cos(0.5 * pitch), np.sin(0.5 * pitch)
+    cy, sy = np.cos(0.5 * yaw), np.sin(0.5 * yaw)
+    # Extrinsic XYZ (roll, pitch, yaw) == intrinsic ZYX.
+    q = np.array(
+        [
+            cr * cp * cy + sr * sp * sy,
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+        ],
+        dtype=float,
+    )
+    return _normalize(q)
+
+
 def dls_ik_compute_qtarget(
     model: mujoco.MjModel,
     data: mujoco.MjData,
@@ -313,11 +330,10 @@ def _validate_chunk(chunk: np.ndarray) -> np.ndarray:
 
 
 def _gripper_cmd_to_discrete(v: float) -> float:
-    if v > 0.33:
+    # User convention: 0=close, 1=open.
+    if v >= 0.5:
         return 1.0
-    if v < -0.33:
-        return -1.0
-    return 0.0
+    return -1.0
 
 
 def _copy_obs_for_request(observation: dict) -> dict:
@@ -341,9 +357,10 @@ def main():
     parser.add_argument("--image-width", type=int, default=224)
     parser.add_argument("--image-height", type=int, default=224)
     parser.add_argument("--jpeg-quality", type=int, default=85)
-    parser.add_argument("--action-mode", choices=["libero_ee_delta", "direct_joint", "delta_joint"], default="libero_ee_delta")
+    parser.add_argument("--action-mode", choices=["eef_pose_ik", "libero_ee_delta", "direct_joint", "delta_joint"], default="eef_pose_ik")
     parser.add_argument("--prefetch-steps", type=int, default=3)
-    parser.add_argument("--query-interval-s", type=float, default=0.0)
+    parser.add_argument("--inference-hz", type=float, default=39.0)
+    parser.add_argument("--query-interval-s", type=float, default=None)
     parser.add_argument("--joint-delta-scale", type=float, default=0.05)
     parser.add_argument("--ee-pos-scale", type=float, default=1.0)
     parser.add_argument("--ee-rot-scale", type=float, default=1.0)
@@ -357,6 +374,12 @@ def main():
     print(f"[INFO] Remote inference: transport={args.transport}, endpoint={args.endpoint}")
     print(f"[INFO] Action mode: {args.action_mode}")
     print(f"[INFO] Mid-way interpolation steps per action: {max(1, int(args.midway_steps))}")
+    if args.query_interval_s is None:
+        args.query_interval_s = 1.0 / max(args.inference_hz, 1e-6)
+    if args.query_interval_s > 0:
+        print(f"[INFO] Inference query interval: {args.query_interval_s:.6f}s ({1.0 / args.query_interval_s:.2f} Hz)")
+    else:
+        print("[INFO] Inference query interval: 0s (query as fast as possible)")
 
     urdf_abs = os.path.abspath(URDF_PATH)
     urdf_dir = os.path.dirname(urdf_abs)
@@ -533,7 +556,31 @@ def main():
                             chunk_step += 1
                             interp_start_q = hold_q_target.copy()
 
-                            if args.action_mode == "direct_joint":
+                            if action.shape[0] == 7 or args.action_mode == "eef_pose_ik":
+                                # 7D policy output is interpreted as:
+                                # [x, y, z, roll, pitch, yaw, gripper(0=close,1=open)].
+                                px, py, pz, rr, rp, ry, g_raw = [float(v) for v in action[:7]]
+                                p_des = np.array([px, py, pz], dtype=float)
+                                p_des[2] = float(np.clip(p_des[2], args.ee_z_min, args.ee_z_max))
+                                q_des = rpy_to_quat(rr, rp, ry)
+
+                                interp_target_q = dls_ik_compute_qtarget(
+                                    model,
+                                    data,
+                                    ee_body_id,
+                                    qpos_adrs,
+                                    dof_adrs,
+                                    p_des,
+                                    q_des,
+                                    rot_w=1.8,
+                                    damping=3e-2,
+                                    dt_step=dt_view,
+                                    qd_max=qd_max,
+                                    iters=10,
+                                )
+                                interp_g_cmd = _gripper_cmd_to_discrete(float(g_raw))
+
+                            elif args.action_mode == "direct_joint":
                                 interp_target_q = np.array(action[:7], dtype=float)
                                 g_raw = float(action[7]) if action.shape[0] >= 8 else 0.0
                                 interp_g_cmd = _gripper_cmd_to_discrete(g_raw)
