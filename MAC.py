@@ -12,11 +12,11 @@ import mujoco.viewer
 from helper_functions import (
     _get_joint_ids_by_name, find_ee_target, build_gripper_controls, quat_from_mat3,
     set_white_environment_visuals, ik_step_dls, apply_gripper,
-    make_R_with_axis_k_down, depth_to_point_cloud_with_color  # [新增] 引入我们写的数学函数
+    make_R_with_axis_k_down, depth_to_point_cloud_with_color
 )
 
 try:
-    import cv2  # only used for JPEG encoding
+    import cv2
 except Exception:
     cv2 = None
 
@@ -149,7 +149,6 @@ def main():
 
     cam_off = np.array([0.0, -0.06841, -0.05044], dtype=float)
 
-    # ================= 修改处：添加深度渲染器 =================
     renderer = mujoco.Renderer(model, width=RENDER_W, height=RENDER_H)
     renderer_depth = mujoco.Renderer(model, width=RENDER_W, height=RENDER_H)
     renderer_depth.enable_depth_rendering()
@@ -162,12 +161,9 @@ def main():
     qd_max = np.full(7, qd_safe, dtype=float)
     dt_inner = dt / IK_ITERS
 
-    # Path / motion (已为西红柿扫描调整)
-    # X 从 0.45 增加到 0.60，让机械臂往前靠，离西红柿（X=0.9）更近
     p_green = np.array([0.60, 0.18, 0.825], dtype=float)
     p_blue = np.array([0.60, -0.18, 0.825], dtype=float)
 
-    # 高度 Z 整体拔高约 0.4 米，来到西红柿的视平线
     z_above = 1.35
     z_pick = 1.25
 
@@ -177,7 +173,17 @@ def main():
 
     def bezier(p0, p1, p2, p3, s):
         s = float(s)
-        return ((1 - s) ** 3) * p0 + 3 * ((1 - s) ** 2) * s * p1 + 3 * (1 - s) * (s ** 2) * p2 + (s ** 3) * p3
+        center_x = 0.90
+        center_y = 0.00
+        radius = 0.35
+
+        angle = -np.pi / 3 + s * (2 * np.pi / 3)
+
+        x = center_x - radius * np.cos(angle)
+        y = center_y + radius * np.sin(angle)
+        z = 1.35 + 0.15 * np.sin(s * np.pi)
+
+        return np.array([x, y, z], dtype=float)
 
     pA0 = np.array([p_green[0], p_green[1], z_above], dtype=float)
     pA1 = np.array([p_green[0], p_green[1], z_pick], dtype=float)
@@ -187,7 +193,6 @@ def main():
     pB1 = np.array([p_blue[0], p_blue[1], z_pick], dtype=float)
     pB2 = np.array([p_blue[0], p_blue[1], z_above], dtype=float)
 
-    # 曲线过渡的中间点也要跟着拔高
     mid_z = 1.45
     c1 = np.array([p_green[0], 0.00, mid_z], dtype=float)
     c2 = np.array([p_blue[0], 0.00, mid_z], dtype=float)
@@ -221,6 +226,12 @@ def main():
         set_white_environment_visuals(model, viewer)
 
         next_step_time = time.perf_counter()
+
+        # 用于累加点云和相机数据的大篮子
+        global_pts_list = []
+        global_clrs_list = []
+        global_cam_data_list = []
+        scan_counter = 0
 
         try:
             while viewer.is_running():
@@ -289,9 +300,6 @@ def main():
 
                             frame_counter += 1
                             if (frame_counter % WRIST_REFRESH_EVERY) == 0:
-                                # ========================================
-                                # 渲染RGB和Depth并拼接发送，同时录制点云
-                                # ========================================
                                 renderer.update_scene(data, camera="wrist_rgb")
                                 wrist_rgb = renderer.render()
                                 if wrist_rgb.dtype != np.uint8:
@@ -317,10 +325,48 @@ def main():
                                         print("[WARN] RGB receiver disconnected (BrokenPipe). Start MAC2.py first.")
                                         return
 
-                                # 生成点云并保存（每次循环覆盖，最终得到结束前的一帧）
-                                pts, clrs = depth_to_point_cloud_with_color(depth_map, wrist_rgb, fovy_deg=60.0)
-                                np.savez("tomato_scan.npz", points=pts, colors=clrs)
-                                # ========================================
+                                    scan_counter += 1
+                                    if scan_counter % 30 == 0:
+                                        pts, clrs = depth_to_point_cloud_with_color(depth_map, wrist_rgb,
+                                                                                    fovy_deg=60.0)
+                                        pts_world = (R_wc @ pts.T).T + p_frame
+
+                                        global_pts_list.append(pts_world)
+                                        global_clrs_list.append(clrs)
+
+                                        np.savez("tomato_scan.npz",
+                                                 points=np.vstack(global_pts_list),
+                                                 colors=np.vstack(global_clrs_list))
+
+                                        # 2. [新增] 计算相机内参矩阵 K (基于垂直 FOV 60度)
+                                        H, W = wrist_rgb.shape[:2]
+                                        f_y = (H / 2.0) / np.tan(np.radians(60.0 / 2.0))
+                                        f_x = f_y  # 假设像素是正方形
+                                        K = [
+                                            [f_x, 0.0, W / 2.0],
+                                            [0.0, f_y, H / 2.0],
+                                            [0.0, 0.0, 1.0]
+                                        ]
+
+                                        # 3. [新增] 组装 4x4 外参矩阵 Pose (相机在世界坐标系下的绝对位置)
+                                        pose_4x4 = np.eye(4)
+                                        pose_4x4[:3, :3] = R_wc  # 旋转矩阵
+                                        pose_4x4[:3, 3] = p_frame  # 平移向量 (XYZ)
+
+                                        # 4. [新增] 存入相机数据篮子并实时写入 JSON 文件
+                                        frame_data = {
+                                            "frame_id": scan_counter,
+                                            "intrinsics": K,
+                                            "pose_world_4x4": pose_4x4.tolist()
+                                        }
+                                        global_cam_data_list.append(frame_data)
+
+                                        import json
+                                        with open("camera_trajectory.json", "w") as f:
+                                            json.dump(global_cam_data_list, f, indent=4)
+
+                                        print(
+                                            f"[扫描中] 抓取第 {len(global_pts_list)} 视角 | 累加点数: {len(np.vstack(global_pts_list))} | 相机位姿已保存!")
 
                             next_step_time += dt
                             sleep_s = next_step_time - time.perf_counter()
@@ -389,9 +435,6 @@ def main():
 
                             frame_counter += 1
                             if (frame_counter % WRIST_REFRESH_EVERY) == 0:
-                                # ========================================
-                                # 渲染RGB和Depth并拼接发送，同时录制点云
-                                # ========================================
                                 renderer.update_scene(data, camera="wrist_rgb")
                                 wrist_rgb = renderer.render()
                                 if wrist_rgb.dtype != np.uint8:
@@ -417,10 +460,51 @@ def main():
                                         print("[WARN] RGB receiver disconnected (BrokenPipe). Start MAC2.py first.")
                                         return
 
-                                # 生成点云并保存（每次循环覆盖，最终得到结束前的一帧）
-                                pts, clrs = depth_to_point_cloud_with_color(depth_map, wrist_rgb, fovy_deg=60.0)
-                                np.savez("tomato_scan.npz", points=pts, colors=clrs)
-                                # ========================================
+                                    # [保留] 抽帧与累加逻辑
+                                    scan_counter += 1
+                                    if scan_counter % 30 == 0:
+                                        # 1. 处理和保存全局点云数据 (完美保留)
+                                        pts, clrs = depth_to_point_cloud_with_color(depth_map, wrist_rgb,
+                                                                                    fovy_deg=60.0)
+                                        pts_world = (R_wc @ pts.T).T + p_frame
+
+                                        global_pts_list.append(pts_world)
+                                        global_clrs_list.append(clrs)
+
+                                        np.savez("tomato_scan.npz",
+                                                 points=np.vstack(global_pts_list),
+                                                 colors=np.vstack(global_clrs_list))
+
+                                        # 2. [新增] 计算相机内参矩阵 K (基于垂直 FOV 60度)
+                                        H, W = wrist_rgb.shape[:2]
+                                        f_y = (H / 2.0) / np.tan(np.radians(60.0 / 2.0))
+                                        f_x = f_y  # 假设像素是正方形
+                                        K = [
+                                            [f_x, 0.0, W / 2.0],
+                                            [0.0, f_y, H / 2.0],
+                                            [0.0, 0.0, 1.0]
+                                        ]
+
+                                        # 3. [新增] 组装 4x4 外参矩阵 Pose (相机在世界坐标系下的绝对位置)
+                                        pose_4x4 = np.eye(4)
+                                        pose_4x4[:3, :3] = R_wc  # 旋转矩阵
+                                        pose_4x4[:3, 3] = p_frame  # 平移向量 (XYZ)
+
+                                        # 4. [新增] 存入相机数据篮子并实时写入 JSON 文件
+                                        frame_data = {
+                                            "frame_id": scan_counter,
+                                            "intrinsics": K,
+                                            "pose_world_4x4": pose_4x4.tolist()
+                                        }
+                                        global_cam_data_list.append(frame_data)
+
+                                        import json
+                                        with open("camera_trajectory.json", "w") as f:
+                                            json.dump(global_cam_data_list, f, indent=4)
+
+                                        print(
+                                            f"[扫描中] 抓取第 {len(global_pts_list)} 视角 | 累加点数: {len(np.vstack(global_pts_list))} | 相机位姿已保存!")
+
 
                             next_step_time += dt
                             sleep_s = next_step_time - time.perf_counter()

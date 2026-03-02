@@ -1,11 +1,6 @@
 import cv2
 import mujoco
 import numpy as np
-
-
-# -----------------------------
-# Quaternion / rotation helpers
-# -----------------------------
 def quat_normalize(q: np.ndarray) -> np.ndarray:
     q = np.asarray(q, dtype=float)
     n = np.linalg.norm(q)
@@ -95,9 +90,6 @@ def rotvec_from_quat(q_err: np.ndarray) -> np.ndarray:
     return axis * angle
 
 
-# -----------------------------
-# MuJoCo helpers
-# -----------------------------
 def _get_joint_ids_by_name(model: mujoco.MjModel, joint_names: list[str]) -> list[int]:
     joint_ids: list[int] = []
     missing: list[str] = []
@@ -155,10 +147,6 @@ def _get_body_id_any(model: mujoco.MjModel, candidates: list[str]) -> tuple[int,
 
 
 def _get_viewport_and_ctx(viewer):
-    """
-    Different mujoco.viewer versions expose these differently.
-    Returns (width, height, ctx_object).
-    """
     # ctx
     ctx = getattr(viewer, "ctx", None)
     if ctx is None:
@@ -181,7 +169,6 @@ def _get_viewport_and_ctx(viewer):
         return int(w), int(h), ctx
 
     raise RuntimeError("Could not access viewer viewport size. Tell me your mujoco.__version__ and viewer attributes.")
-
 
 # -----------------------------
 # IK (damped least squares) + safe speed limit

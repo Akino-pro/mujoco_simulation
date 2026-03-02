@@ -2,7 +2,7 @@ import socket
 import struct
 
 import numpy as np
-import cv2  # here we DO use imshow safely (separate process)
+import cv2
 
 HOST = "127.0.0.1"
 PORT = 5005
